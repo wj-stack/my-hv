@@ -19,8 +19,8 @@
 
 **Purpose**: Project initialization and basic structure
 
-- [ ] T001 Create module layout in `driver/src/` (`vmx.rs`, `vmcs.rs`, `vcpu.rs`, `exit_handlers.rs`, `ept.rs`, `hypercalls.rs`, `introspection.rs`, `logger.rs`, `mm.rs`, `timing.rs`, `arch.rs`, `gdt.rs`, `idt.rs`, `segment.rs`) and wire in `driver/src/lib.rs`
-- [ ] T002 [P] Add mapping notes in the new modules referencing counterparts in `hv/hv/*`
+- [X] T001 Create module layout in `driver/src/` (`vmx.rs`, `vmcs.rs`, `vcpu.rs`, `exit_handlers.rs`, `ept.rs`, `hypercalls.rs`, `introspection.rs`, `logger.rs`, `mm.rs`, `timing.rs`, `arch.rs`, `gdt.rs`, `idt.rs`, `segment.rs`) and wire in `driver/src/lib.rs`
+- [X] T002 [P] Add mapping notes in the new modules referencing counterparts in `hv/hv/*`
 
 ---
 
@@ -30,10 +30,10 @@
 
 **⚠️ CRITICAL**: No user story work can begin until this phase is complete
 
-- [ ] T003 Define hypercall key, contract version, and hypercall codes in `shared-contract/src/lib.rs`
-- [ ] T004 Implement driver entry/unload flow in `driver/src/lib.rs` aligned with `hv/hv/main.cpp` (start/stop virtualization + ping)
-- [ ] T005 Implement VMCALL dispatch skeleton in `driver/src/hypercalls.rs` returning explicit errors for unimplemented ops
-- [ ] T006 Update `client/src/main.rs` or `hv/um/*` to add hypercall commands with placeholders
+- [X] T003 Define hypercall key, contract version, and hypercall codes in `shared-contract/src/lib.rs`
+- [X] T004 Implement driver entry/unload flow in `driver/src/lib.rs` aligned with `hv/hv/main.cpp` (start/stop virtualization + ping)
+- [X] T005 Implement VMCALL dispatch skeleton in `driver/src/hypercalls.rs` returning explicit errors for unimplemented ops
+- [X] T006 Update `client/src/main.rs` or `hv/um/*` to add hypercall commands with placeholders
 
 **Checkpoint**: Foundation ready - user story implementation can now begin in parallel
 
@@ -47,11 +47,11 @@
 
 ### Implementation for User Story 1
 
-- [ ] T007 [P] [US1] Implement VT-x capability checks and VMXON/VMXOFF flow in `driver/src/vmx.rs`
-- [ ] T008 [P] [US1] Implement VCPU/VMCS initialization lifecycle in `driver/src/vcpu.rs` and `driver/src/vmcs.rs`
-- [ ] T009 [US1] Implement `PING`/`UNLOAD` handlers in `driver/src/hypercalls.rs` (depends on T007, T008)
-- [ ] T010 [US1] Wire VMCALL handling into VM-exit path in `driver/src/exit_handlers.rs` (depends on T009)
-- [ ] T011 [US1] Implement `PING`/`UNLOAD` calls in `client/src/main.rs` or `hv/um/*`
+- [X] T007 [P] [US1] Implement VT-x capability checks and VMXON/VMXOFF flow in `driver/src/vmx.rs`
+- [X] T008 [P] [US1] Implement VCPU/VMCS initialization lifecycle in `driver/src/vcpu.rs` and `driver/src/vmcs.rs`
+- [X] T009 [US1] Implement `PING`/`UNLOAD` handlers in `driver/src/hypercalls.rs` (depends on T007, T008)
+- [X] T010 [US1] Wire VMCALL handling into VM-exit path in `driver/src/exit_handlers.rs` (depends on T009)
+- [X] T011 [US1] Implement `PING`/`UNLOAD` calls in `client/src/main.rs` or `hv/um/*`
 
 **Checkpoint**: At this point, User Story 1 should be fully functional and testable independently
 
@@ -65,9 +65,9 @@
 
 ### Implementation for User Story 2
 
-- [ ] T012 [US2] Implement `QUERY_PROCESS_CR3`/`GET_HV_BASE`/`FLUSH_LOGS` handlers in `driver/src/hypercalls.rs`
-- [ ] T013 [US2] Add query/log commands in `client/src/main.rs` or `hv/um/*`
-- [ ] T014 [US2] Sync hypercall contract description in `specs/001-refactor-vtx-driver/contracts/driver-interface.md`
+- [X] T012 [US2] Implement `QUERY_PROCESS_CR3`/`GET_HV_BASE`/`FLUSH_LOGS` handlers in `driver/src/hypercalls.rs`
+- [X] T013 [US2] Add query/log commands in `client/src/main.rs` or `hv/um/*`
+- [X] T014 [US2] Sync hypercall contract description in `specs/001-refactor-vtx-driver/contracts/driver-interface.md`
 
 **Checkpoint**: At this point, User Stories 1 AND 2 should both work independently
 
@@ -81,9 +81,9 @@
 
 ### Implementation for User Story 3
 
-- [ ] T015 [P] [US3] Add hypercall argument validation and error mapping in `driver/src/hypercalls.rs`
-- [ ] T016 [P] [US3] Add safe shutdown path for active VCPUs in `driver/src/lib.rs`
-- [ ] T017 [US3] Add diagnostic logging in `driver/src/logger.rs` and wire in `driver/src/exit_handlers.rs`
+- [X] T015 [P] [US3] Add hypercall argument validation and error mapping in `driver/src/hypercalls.rs`
+- [X] T016 [P] [US3] Add safe shutdown path for active VCPUs in `driver/src/lib.rs`
+- [X] T017 [US3] Add diagnostic logging in `driver/src/logger.rs` and wire in `driver/src/exit_handlers.rs`
 
 **Checkpoint**: All user stories should now be independently functional
 
@@ -93,9 +93,9 @@
 
 **Purpose**: Improvements that affect multiple user stories
 
-- [ ] T018 [P] Update `README.md` with new hypercall command examples
-- [ ] T019 Update `specs/001-refactor-vtx-driver/quickstart.md` with validated steps and any caveats
-- [ ] T020 [P] Run `build.bat` and record a short build/validation note in `specs/001-refactor-vtx-driver/quickstart.md`
+- [X] T018 [P] Update `README.md` with new hypercall command examples
+- [X] T019 Update `specs/001-refactor-vtx-driver/quickstart.md` with validated steps and any caveats
+- [X] T020 [P] Run `build.bat` and record a short build/validation note in `specs/001-refactor-vtx-driver/quickstart.md`
 
 ---
 

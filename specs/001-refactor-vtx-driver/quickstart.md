@@ -18,6 +18,10 @@
 ## Minimum Validation
 
 1. 安装并加载生成的驱动。
-2. 使用用户态 `client` 调用 `INIT`/`START`/`STOP`/`QUERY`/`SHUTDOWN` 验证基础流程。
-3. 在不支持 VT-x 的机器或禁用 VT-x 时，`INIT` 返回可识别错误。
-4. 重复启动/停止 20 次，确保无系统崩溃或驱动异常退出。
+2. 使用用户态 `my-hv-client`（见根目录 `README.md` 示例）：`ping` → `start` → `hv-ping` → `stop`（或 `hv-unload`）。
+3. 在不支持 VT-x 的机器或禁用 VT-x 时，`start`（`IOCTL_HV_START`）应返回失败状态（例如 `STATUS_NOT_SUPPORTED`）。
+4. 重复 `start` / `stop` 多次，确保无系统崩溃或驱动异常退出。
+
+## Build validation note
+
+- 2026-04-23：在本机 eWDK 环境下执行仓库根目录 `.\build.bat`，驱动包 `my_hv_driver_package` 与用户态 `my-hv-client` 均构建成功。

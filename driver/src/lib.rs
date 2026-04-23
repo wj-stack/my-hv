@@ -1,6 +1,5 @@
-//! Minimal WDM driver template: device object, symbolic link, ping/echo IOCTLs only.
-//! Pairing constants come from `shared-contract`; device strings MUST stay aligned with
-//! `shared_contract::DEVICE_BASENAME` / `USER_DEVICE_PATH` (see project `README.md`).
+//! WDM 驱动：设备对象、符号链接、IOCTL（模板 ping/echo + HV START/STOP + 超级调用）。
+//! 设备名字符串必须与 `shared_contract::DEVICE_BASENAME` 一致。
 
 #![no_std]
 extern crate alloc;
@@ -8,22 +7,48 @@ extern crate alloc;
 #[cfg(not(test))]
 extern crate wdk_panic;
 
+use alloc::string::String;
+use core::cell::UnsafeCell;
 use core::mem::size_of;
 
 #[cfg(not(test))]
 use wdk_alloc::WdkAllocator;
 use wdk::println;
+use wdk_sys::ntddk::{
+    KeAcquireGuardedMutex, KeInitializeGuardedMutex, KeReleaseGuardedMutex,
+};
 use wdk_sys::{
-    CCHAR, DEVICE_OBJECT, DRIVER_OBJECT, IO_NO_INCREMENT, IRP, NTSTATUS, PCUNICODE_STRING,
-    STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER,
-    STATUS_SUCCESS, STATUS_UNSUCCESSFUL, UNICODE_STRING,
+    CCHAR, DEVICE_OBJECT, DRIVER_OBJECT, IO_NO_INCREMENT, IRP, KGUARDED_MUTEX, NTSTATUS,
+    PCUNICODE_STRING, STATUS_ALREADY_INITIALIZED, STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_DEVICE_REQUEST,
+    STATUS_INVALID_PARAMETER, STATUS_SUCCESS, STATUS_UNSUCCESSFUL, UNICODE_STRING,
 };
 
 #[cfg(not(test))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
-use shared_contract::{ECHO_MAX_LEN, IOCTL_ECHO, IOCTL_PING, PING_RESPONSE_U32};
+mod arch;
+mod ept;
+mod exit_handlers;
+mod gdt;
+mod hypercalls;
+mod ia32;
+mod idt;
+mod introspection;
+mod logger;
+mod mm;
+mod segment;
+mod timing;
+mod vmcs;
+mod vcpu;
+mod vmx;
+
+use shared_contract::{
+    DEVICE_BASENAME, ECHO_MAX_LEN, HvHypercallIn, HvHypercallOut, IOCTL_ECHO, IOCTL_HV_HYPERCALL,
+    IOCTL_HV_START, IOCTL_HV_STOP, IOCTL_PING, PING_RESPONSE_U32,
+};
+
+use crate::vcpu::VmxCluster;
 
 const IRP_MJ_CREATE_INDEX: usize = 0x00;
 const IRP_MJ_CLOSE_INDEX: usize = 0x02;
@@ -33,10 +58,12 @@ const FILE_DEVICE_UNKNOWN: u32 = 0x0000_0022;
 const FILE_DEVICE_SECURE_OPEN: u32 = 0x0000_0100;
 const DO_BUFFERED_IO: u32 = 0x0000_0004;
 
-/// Must match `shared_contract::DEVICE_BASENAME` (`\Device\{basename}`).
-const DEVICE_NAME: &str = "\\Device\\MyHvTpl";
-/// Must match user-mode `\\.\{basename}`.
-const SYMLINK_NAME: &str = "\\DosDevices\\MyHvTpl";
+struct SyncSession(UnsafeCell<Option<VmxCluster>>);
+// SAFETY: 仅通过 `SESSION_MUTEX` 下的 `with_session` 访问。
+unsafe impl Sync for SyncSession {}
+
+static SESSION: SyncSession = SyncSession(UnsafeCell::new(None));
+static mut SESSION_MUTEX: KGUARDED_MUTEX = unsafe { core::mem::zeroed() };
 
 fn encode_utf16z(input: &str, out: &mut [u16]) -> Option<usize> {
     let mut idx = 0;
@@ -66,6 +93,15 @@ unsafe fn complete_request(irp: *mut IRP, status: NTSTATUS, info: usize) -> NTST
         wdk_sys::ntddk::IofCompleteRequest(irp, IO_NO_INCREMENT as CCHAR);
     }
     status
+}
+
+unsafe fn with_session<R>(f: impl FnOnce(&mut Option<VmxCluster>) -> R) -> R {
+    unsafe {
+        KeAcquireGuardedMutex(&raw mut SESSION_MUTEX);
+        let r = f(&mut *SESSION.0.get());
+        KeReleaseGuardedMutex(&raw mut SESSION_MUTEX);
+        r
+    }
 }
 
 unsafe extern "C" fn dispatch_create_close(
@@ -122,16 +158,73 @@ unsafe extern "C" fn dispatch_device_control(
             if system_buffer.is_null() {
                 return unsafe { complete_request(irp, STATUS_UNSUCCESSFUL, 0) };
             }
-            // METHOD_BUFFERED: I/O manager already placed input in `SystemBuffer`; echo is identity.
             unsafe { complete_request(irp, STATUS_SUCCESS, input_len) }
+        }
+        IOCTL_HV_START => {
+            let status = unsafe {
+                with_session(|session| {
+                    if session.is_some() {
+                        return STATUS_ALREADY_INITIALIZED;
+                    }
+                    match unsafe { VmxCluster::start() } {
+                        Ok(c) => {
+                            *session = Some(c);
+                            STATUS_SUCCESS
+                        }
+                        Err(e) => e,
+                    }
+                })
+            };
+            unsafe { complete_request(irp, status, 0) }
+        }
+        IOCTL_HV_STOP => {
+            let status = unsafe {
+                with_session(|session| {
+                    if let Some(mut c) = session.take() {
+                        unsafe { c.stop() };
+                    }
+                    STATUS_SUCCESS
+                })
+            };
+            unsafe { complete_request(irp, status, 0) }
+        }
+        IOCTL_HV_HYPERCALL => {
+            if input_len < size_of::<HvHypercallIn>() || output_len < size_of::<HvHypercallOut>() {
+                return unsafe { complete_request(irp, STATUS_BUFFER_TOO_SMALL, 0) };
+            }
+            if system_buffer.is_null() {
+                return unsafe { complete_request(irp, STATUS_UNSUCCESSFUL, 0) };
+            }
+            let inp = unsafe { system_buffer.cast::<HvHypercallIn>().read_unaligned() };
+            let out = unsafe {
+                with_session(|session| hypercalls::dispatch(session, &inp))
+            };
+            unsafe {
+                system_buffer
+                    .cast::<HvHypercallOut>()
+                    .write_unaligned(out);
+            }
+            unsafe {
+                complete_request(irp, STATUS_SUCCESS, size_of::<HvHypercallOut>())
+            }
         }
         _ => unsafe { complete_request(irp, STATUS_INVALID_DEVICE_REQUEST, 0) },
     }
 }
 
 extern "C" fn driver_unload(driver: *mut DRIVER_OBJECT) {
+    unsafe {
+        with_session(|session| {
+            if let Some(mut c) = session.take() {
+                c.stop();
+            }
+        });
+    }
+
     let mut symlink_buf = [0u16; 96];
-    let symlink_used = match encode_utf16z(SYMLINK_NAME, &mut symlink_buf) {
+    let mut devname = String::from("\\DosDevices\\");
+    devname.push_str(DEVICE_BASENAME);
+    let symlink_used = match encode_utf16z(&devname, &mut symlink_buf) {
         Some(v) => v,
         None => return,
     };
@@ -155,13 +248,20 @@ pub unsafe extern "system" fn driver_entry(
     driver: &mut DRIVER_OBJECT,
     _registry_path: PCUNICODE_STRING,
 ) -> NTSTATUS {
+    unsafe {
+        KeInitializeGuardedMutex(&raw mut SESSION_MUTEX);
+    }
+
     driver.DriverUnload = Some(driver_unload);
     driver.MajorFunction[IRP_MJ_CREATE_INDEX] = Some(dispatch_create_close);
     driver.MajorFunction[IRP_MJ_CLOSE_INDEX] = Some(dispatch_create_close);
     driver.MajorFunction[IRP_MJ_DEVICE_CONTROL_INDEX] = Some(dispatch_device_control);
 
+    let mut dev_kernel = String::from("\\Device\\");
+    dev_kernel.push_str(DEVICE_BASENAME);
+
     let mut device_name_buf = [0u16; 96];
-    let device_used = match encode_utf16z(DEVICE_NAME, &mut device_name_buf) {
+    let device_used = match encode_utf16z(&dev_kernel, &mut device_name_buf) {
         Some(v) => v,
         None => return STATUS_UNSUCCESSFUL,
     };
@@ -188,7 +288,9 @@ pub unsafe extern "system" fn driver_entry(
     }
 
     let mut symlink_buf = [0u16; 96];
-    let symlink_used = match encode_utf16z(SYMLINK_NAME, &mut symlink_buf) {
+    let mut symlink_str = String::from("\\DosDevices\\");
+    symlink_str.push_str(DEVICE_BASENAME);
+    let symlink_used = match encode_utf16z(&symlink_str, &mut symlink_buf) {
         Some(v) => v,
         None => {
             unsafe {
@@ -208,10 +310,10 @@ pub unsafe extern "system" fn driver_entry(
     }
 
     println!(
-        "{} loaded ({} -> {})",
+        "{} loaded (contract {}, device \\Device\\{})",
         "my-hv-driver",
-        DEVICE_NAME,
-        SYMLINK_NAME
+        shared_contract::CONTRACT_VERSION,
+        DEVICE_BASENAME
     );
     STATUS_SUCCESS
 }

@@ -39,3 +39,18 @@ cargo generate --path nt-minimal-template --name my-wdm-sample
 本目录作为 **cargo-generate 模板源** 时，`Cargo.toml`、源码等处含有 Liquid 占位符；请勿在未展开占位符的模板根目录直接 `cargo build`。请在 **生成后的新项目目录** 中构建与调试。
 
 INF 模板在仓库中的文件名为 `crate_name` 加后缀 `_driver.inx`（与 `项目名-driver` 包产出的 `*_driver.sys` 一致）；文件名里未使用带竖线 `|` 的 Liquid 过滤器，以便在 Windows 上正常纳入版本控制。
+
+## 本仓库 VT-x 驱动与 `my-hv-client`
+
+在已配置 WDK/eWDK 的机器上，于仓库根目录执行 `.\build.bat` 完成驱动签名包与用户态客户端构建。
+
+安装并启动驱动后，可使用 `my-hv-client`（设备路径默认 `\\.\MyHvTpl`，与 `shared_contract::USER_DEVICE_PATH` 一致）：
+
+```text
+my-hv-client ping
+my-hv-client start
+my-hv-client hv-ping
+my-hv-client stop
+```
+
+超级调用使用与 `hv/um/hv.h` 相同的 RAX 打包：`rax = (HYPERCALL_KEY << 8) | (opcode as u8)`。契约说明见 `specs/001-refactor-vtx-driver/contracts/driver-interface.md`。

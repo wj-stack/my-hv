@@ -9,6 +9,16 @@
 - **Contract Version**: `0.1.0`（与 `shared-contract` 同步）
 - **Hypercall Key**: 由 `shared-contract` 统一定义，用户态与内核态保持一致
 
+## IOCTL Control Codes
+
+| IOCTL | Purpose |
+|-------|---------|
+| `IOCTL_PING` | 模板层连通性（返回 `PING_RESPONSE_U32`） |
+| `IOCTL_ECHO` | 模板层回显 |
+| `IOCTL_HV_START` | 在所有活动逻辑处理器上执行 VMXON + VMCLEAR/VMPTRLD，进入 VMX root |
+| `IOCTL_HV_STOP` | 每 CPU `VMCLEAR` + `VMXOFF` 并释放资源 |
+| `IOCTL_HV_HYPERCALL` | 缓冲的 `HvHypercallIn` / `HvHypercallOut` 超级调用桥（与 VMCALL 语义对齐） |
+
 ## Hypercall Requests
 
 | Operation | Purpose | Input | Output | Failure Modes |
