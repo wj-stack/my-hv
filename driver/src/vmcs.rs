@@ -1,7 +1,7 @@
 //! VMCS 区域初始化与访问封装。对应 `hv/hv/vmcs.h`、`hv/hv/vmcs.cpp`。
 
 use crate::{arch, ia32};
-use crate::{gdt, idt};
+use crate::{gdt, idt, segment};
 
 /// VMCS 字段编码（Intel SDM full encoding）。
 #[repr(transparent)]
@@ -44,7 +44,68 @@ impl VmcsField {
     pub const GUEST_CR4: Self = Self(ia32::VMCS_GUEST_CR4);
     pub const GUEST_DR7: Self = Self(ia32::VMCS_GUEST_DR7);
     pub const GUEST_VMCS_LINK_POINTER: Self = Self(ia32::VMCS_GUEST_VMCS_LINK_POINTER);
+    pub const GUEST_DEBUGCTL: Self = Self(ia32::VMCS_GUEST_DEBUGCTL);
+    pub const GUEST_PAT: Self = Self(ia32::VMCS_GUEST_PAT);
+    pub const GUEST_EFER: Self = Self(ia32::VMCS_GUEST_EFER);
+    pub const GUEST_ES_SELECTOR: Self = Self(ia32::VMCS_GUEST_ES_SELECTOR);
+    pub const GUEST_CS_SELECTOR: Self = Self(ia32::VMCS_GUEST_CS_SELECTOR);
+    pub const GUEST_SS_SELECTOR: Self = Self(ia32::VMCS_GUEST_SS_SELECTOR);
+    pub const GUEST_DS_SELECTOR: Self = Self(ia32::VMCS_GUEST_DS_SELECTOR);
+    pub const GUEST_FS_SELECTOR: Self = Self(ia32::VMCS_GUEST_FS_SELECTOR);
+    pub const GUEST_GS_SELECTOR: Self = Self(ia32::VMCS_GUEST_GS_SELECTOR);
+    pub const GUEST_LDTR_SELECTOR: Self = Self(ia32::VMCS_GUEST_LDTR_SELECTOR);
+    pub const GUEST_TR_SELECTOR: Self = Self(ia32::VMCS_GUEST_TR_SELECTOR);
+    pub const GUEST_ES_LIMIT: Self = Self(ia32::VMCS_GUEST_ES_LIMIT);
+    pub const GUEST_CS_LIMIT: Self = Self(ia32::VMCS_GUEST_CS_LIMIT);
+    pub const GUEST_SS_LIMIT: Self = Self(ia32::VMCS_GUEST_SS_LIMIT);
+    pub const GUEST_DS_LIMIT: Self = Self(ia32::VMCS_GUEST_DS_LIMIT);
+    pub const GUEST_FS_LIMIT: Self = Self(ia32::VMCS_GUEST_FS_LIMIT);
+    pub const GUEST_GS_LIMIT: Self = Self(ia32::VMCS_GUEST_GS_LIMIT);
+    pub const GUEST_LDTR_LIMIT: Self = Self(ia32::VMCS_GUEST_LDTR_LIMIT);
+    pub const GUEST_TR_LIMIT: Self = Self(ia32::VMCS_GUEST_TR_LIMIT);
+    pub const GUEST_GDTR_LIMIT: Self = Self(ia32::VMCS_GUEST_GDTR_LIMIT);
+    pub const GUEST_IDTR_LIMIT: Self = Self(ia32::VMCS_GUEST_IDTR_LIMIT);
+    pub const GUEST_ES_ACCESS_RIGHTS: Self = Self(ia32::VMCS_GUEST_ES_ACCESS_RIGHTS);
+    pub const GUEST_CS_ACCESS_RIGHTS: Self = Self(ia32::VMCS_GUEST_CS_ACCESS_RIGHTS);
+    pub const GUEST_SS_ACCESS_RIGHTS: Self = Self(ia32::VMCS_GUEST_SS_ACCESS_RIGHTS);
+    pub const GUEST_DS_ACCESS_RIGHTS: Self = Self(ia32::VMCS_GUEST_DS_ACCESS_RIGHTS);
+    pub const GUEST_FS_ACCESS_RIGHTS: Self = Self(ia32::VMCS_GUEST_FS_ACCESS_RIGHTS);
+    pub const GUEST_GS_ACCESS_RIGHTS: Self = Self(ia32::VMCS_GUEST_GS_ACCESS_RIGHTS);
+    pub const GUEST_LDTR_ACCESS_RIGHTS: Self = Self(ia32::VMCS_GUEST_LDTR_ACCESS_RIGHTS);
+    pub const GUEST_TR_ACCESS_RIGHTS: Self = Self(ia32::VMCS_GUEST_TR_ACCESS_RIGHTS);
+    pub const GUEST_INTERRUPTIBILITY_STATE: Self = Self(ia32::VMCS_GUEST_INTERRUPTIBILITY_STATE);
     pub const GUEST_ACTIVITY_STATE: Self = Self(ia32::VMCS_GUEST_ACTIVITY_STATE);
+    pub const GUEST_IA32_SYSENTER_CS: Self = Self(ia32::VMCS_GUEST_IA32_SYSENTER_CS);
+    pub const GUEST_ES_BASE: Self = Self(ia32::VMCS_GUEST_ES_BASE);
+    pub const GUEST_CS_BASE: Self = Self(ia32::VMCS_GUEST_CS_BASE);
+    pub const GUEST_SS_BASE: Self = Self(ia32::VMCS_GUEST_SS_BASE);
+    pub const GUEST_DS_BASE: Self = Self(ia32::VMCS_GUEST_DS_BASE);
+    pub const GUEST_FS_BASE: Self = Self(ia32::VMCS_GUEST_FS_BASE);
+    pub const GUEST_GS_BASE: Self = Self(ia32::VMCS_GUEST_GS_BASE);
+    pub const GUEST_LDTR_BASE: Self = Self(ia32::VMCS_GUEST_LDTR_BASE);
+    pub const GUEST_TR_BASE: Self = Self(ia32::VMCS_GUEST_TR_BASE);
+    pub const GUEST_GDTR_BASE: Self = Self(ia32::VMCS_GUEST_GDTR_BASE);
+    pub const GUEST_IDTR_BASE: Self = Self(ia32::VMCS_GUEST_IDTR_BASE);
+    pub const GUEST_IA32_SYSENTER_ESP: Self = Self(ia32::VMCS_GUEST_IA32_SYSENTER_ESP);
+    pub const GUEST_IA32_SYSENTER_EIP: Self = Self(ia32::VMCS_GUEST_IA32_SYSENTER_EIP);
+    pub const HOST_ES_SELECTOR: Self = Self(ia32::VMCS_HOST_ES_SELECTOR);
+    pub const HOST_CS_SELECTOR: Self = Self(ia32::VMCS_HOST_CS_SELECTOR);
+    pub const HOST_SS_SELECTOR: Self = Self(ia32::VMCS_HOST_SS_SELECTOR);
+    pub const HOST_DS_SELECTOR: Self = Self(ia32::VMCS_HOST_DS_SELECTOR);
+    pub const HOST_FS_SELECTOR: Self = Self(ia32::VMCS_HOST_FS_SELECTOR);
+    pub const HOST_GS_SELECTOR: Self = Self(ia32::VMCS_HOST_GS_SELECTOR);
+    pub const HOST_TR_SELECTOR: Self = Self(ia32::VMCS_HOST_TR_SELECTOR);
+    pub const HOST_FS_BASE: Self = Self(ia32::VMCS_HOST_FS_BASE);
+    pub const HOST_GS_BASE: Self = Self(ia32::VMCS_HOST_GS_BASE);
+    pub const HOST_TR_BASE: Self = Self(ia32::VMCS_HOST_TR_BASE);
+    pub const HOST_IA32_SYSENTER_CS: Self = Self(ia32::VMCS_HOST_IA32_SYSENTER_CS);
+    pub const HOST_IA32_SYSENTER_ESP: Self = Self(ia32::VMCS_HOST_IA32_SYSENTER_ESP);
+    pub const HOST_IA32_SYSENTER_EIP: Self = Self(ia32::VMCS_HOST_IA32_SYSENTER_EIP);
+    pub const HOST_PAT: Self = Self(ia32::VMCS_HOST_PAT);
+    pub const HOST_EFER: Self = Self(ia32::VMCS_HOST_EFER);
+    pub const EXIT_QUALIFICATION: Self = Self(ia32::VMCS_EXIT_QUALIFICATION);
+    pub const VMEXIT_INSTRUCTION_LEN: Self = Self(ia32::VMCS_VM_EXIT_INSTRUCTION_LEN);
+    pub const VMEXIT_INTERRUPTION_INFO: Self = Self(ia32::VMCS_VMEXIT_INTERRUPTION_INFO);
 
     #[inline]
     pub const fn raw(self) -> u32 {
@@ -93,7 +154,7 @@ pub struct VmExitReason {
 
 impl VmExitReason {
     #[inline]
-    fn from_raw(raw: u32) -> Self {
+    pub fn from_raw(raw: u32) -> Self {
         Self {
             raw,
             basic: (raw & 0xFFFF) as u16,
@@ -197,19 +258,144 @@ pub unsafe fn vmread(field: VmcsField) -> Result<u64, VmcsAccessError> {
     }
 }
 
-/// 写入最小 guest/control 字段集合，为后续 VM-entry/VM-exit 完整编排做铺垫。
-///
-/// 该函数遵循“先镜像当前主机关键状态，再由后续阶段覆盖细节字段”的策略。
+/// 写入 guest RIP/RSP/RFLAGS、CR3 与 CR 影子，供 `VMLAUNCH`/`VMRESUME` 使用。
 ///
 /// # Safety
 /// 调用前必须已 `VMPTRLD` 当前 VMCS，且运行在 VMX root。
-pub unsafe fn seed_minimal_guest_state() -> Result<(), VmcsAccessError> {
+pub unsafe fn seed_guest_entry_state(rip: u64, rsp: u64, rflags: u64) -> Result<(), VmcsAccessError> {
     unsafe { vmwrite(VmcsField::GUEST_CR3, arch::read_cr3())? };
-    unsafe { vmwrite(VmcsField::GUEST_RIP, 0)? };
-    unsafe { vmwrite(VmcsField::GUEST_RSP, 0)? };
-    unsafe { vmwrite(VmcsField::GUEST_RFLAGS, 0x2)? };
+    unsafe { vmwrite(VmcsField::GUEST_RIP, rip)? };
+    unsafe { vmwrite(VmcsField::GUEST_RSP, rsp)? };
+    unsafe { vmwrite(VmcsField::GUEST_RFLAGS, rflags)? };
     unsafe { vmwrite(VmcsField::CTRL_CR0_READ_SHADOW, arch::read_cr0())? };
     unsafe { vmwrite(VmcsField::CTRL_CR4_READ_SHADOW, arch::read_cr4() & !CR4_VMXE)? };
+    Ok(())
+}
+
+#[inline]
+unsafe fn vmwrite_segment(
+    selector: VmcsField,
+    limit: VmcsField,
+    ar: VmcsField,
+    base: VmcsField,
+    ps: segment::ParsedSegment,
+) -> Result<(), VmcsAccessError> {
+    unsafe {
+        vmwrite(selector, ps.selector as u64)?;
+        vmwrite(limit, ps.limit as u64)?;
+        vmwrite(ar, ps.access_rights as u64)?;
+        vmwrite(base, ps.base)?;
+    }
+    Ok(())
+}
+
+/// Guest 段、GDTR/IDTR、SYSENTER、DEBUGCTL/PAT/EFER 镜像当前 CPU。
+///
+/// # Safety
+/// 需要已 `VMPTRLD`。
+pub unsafe fn configure_guest_segment_state() -> Result<(), VmcsAccessError> {
+    let gdtr = gdt::read_gdtr();
+    let idtr = idt::read_idtr();
+    let gdtr_limit = unsafe { core::ptr::addr_of!(gdtr.limit).read_unaligned() } as u64;
+    let gdtr_base = unsafe { core::ptr::addr_of!(gdtr.base).read_unaligned() };
+    let idtr_limit = unsafe { core::ptr::addr_of!(idtr.limit).read_unaligned() } as u64;
+    let idtr_base = unsafe { core::ptr::addr_of!(idtr.base).read_unaligned() };
+
+    let sel = segment::read_segment_selectors();
+    let es = segment::parse_segment(&gdtr, sel.es);
+    let cs = segment::parse_segment(&gdtr, sel.cs);
+    let ss = segment::parse_segment(&gdtr, sel.ss);
+    let ds = segment::parse_segment(&gdtr, sel.ds);
+    let mut fs = segment::parse_segment(&gdtr, sel.fs);
+    let mut gs = segment::parse_segment(&gdtr, sel.gs);
+    fs.base = unsafe { arch::rdmsr(ia32::IA32_FS_BASE) };
+    gs.base = unsafe { arch::rdmsr(ia32::IA32_GS_BASE) };
+    let tr = segment::parse_segment(&gdtr, sel.tr);
+    let ldtr = segment::parse_ldtr(&gdtr);
+
+    unsafe {
+        vmwrite_segment(
+            VmcsField::GUEST_ES_SELECTOR,
+            VmcsField::GUEST_ES_LIMIT,
+            VmcsField::GUEST_ES_ACCESS_RIGHTS,
+            VmcsField::GUEST_ES_BASE,
+            es,
+        )?;
+        vmwrite_segment(
+            VmcsField::GUEST_CS_SELECTOR,
+            VmcsField::GUEST_CS_LIMIT,
+            VmcsField::GUEST_CS_ACCESS_RIGHTS,
+            VmcsField::GUEST_CS_BASE,
+            cs,
+        )?;
+        vmwrite_segment(
+            VmcsField::GUEST_SS_SELECTOR,
+            VmcsField::GUEST_SS_LIMIT,
+            VmcsField::GUEST_SS_ACCESS_RIGHTS,
+            VmcsField::GUEST_SS_BASE,
+            ss,
+        )?;
+        vmwrite_segment(
+            VmcsField::GUEST_DS_SELECTOR,
+            VmcsField::GUEST_DS_LIMIT,
+            VmcsField::GUEST_DS_ACCESS_RIGHTS,
+            VmcsField::GUEST_DS_BASE,
+            ds,
+        )?;
+        vmwrite_segment(
+            VmcsField::GUEST_FS_SELECTOR,
+            VmcsField::GUEST_FS_LIMIT,
+            VmcsField::GUEST_FS_ACCESS_RIGHTS,
+            VmcsField::GUEST_FS_BASE,
+            fs,
+        )?;
+        vmwrite_segment(
+            VmcsField::GUEST_GS_SELECTOR,
+            VmcsField::GUEST_GS_LIMIT,
+            VmcsField::GUEST_GS_ACCESS_RIGHTS,
+            VmcsField::GUEST_GS_BASE,
+            gs,
+        )?;
+        vmwrite_segment(
+            VmcsField::GUEST_LDTR_SELECTOR,
+            VmcsField::GUEST_LDTR_LIMIT,
+            VmcsField::GUEST_LDTR_ACCESS_RIGHTS,
+            VmcsField::GUEST_LDTR_BASE,
+            ldtr,
+        )?;
+        vmwrite_segment(
+            VmcsField::GUEST_TR_SELECTOR,
+            VmcsField::GUEST_TR_LIMIT,
+            VmcsField::GUEST_TR_ACCESS_RIGHTS,
+            VmcsField::GUEST_TR_BASE,
+            tr,
+        )?;
+
+        vmwrite(VmcsField::GUEST_GDTR_LIMIT, gdtr_limit)?;
+        vmwrite(VmcsField::GUEST_GDTR_BASE, gdtr_base)?;
+        vmwrite(VmcsField::GUEST_IDTR_LIMIT, idtr_limit)?;
+        vmwrite(VmcsField::GUEST_IDTR_BASE, idtr_base)?;
+
+        vmwrite(
+            VmcsField::GUEST_IA32_SYSENTER_CS,
+            unsafe { arch::rdmsr(ia32::IA32_SYSENTER_CS) } & 0xFFFF,
+        )?;
+        vmwrite(
+            VmcsField::GUEST_IA32_SYSENTER_ESP,
+            unsafe { arch::rdmsr(ia32::IA32_SYSENTER_ESP) },
+        )?;
+        vmwrite(
+            VmcsField::GUEST_IA32_SYSENTER_EIP,
+            unsafe { arch::rdmsr(ia32::IA32_SYSENTER_EIP) },
+        )?;
+
+        vmwrite(VmcsField::GUEST_DEBUGCTL, unsafe { arch::rdmsr(ia32::IA32_DEBUGCTL) })?;
+        vmwrite(VmcsField::GUEST_PAT, unsafe { arch::rdmsr(ia32::IA32_PAT) })?;
+        vmwrite(VmcsField::GUEST_EFER, unsafe { arch::read_msr_efer() })?;
+
+        vmwrite(VmcsField::GUEST_INTERRUPTIBILITY_STATE, 0)?;
+        vmwrite(VmcsField::GUEST_ACTIVITY_STATE, 0)?;
+    }
     Ok(())
 }
 
@@ -246,17 +432,32 @@ pub unsafe fn configure_control_fields(maybe_msr_bitmap_pa: Option<u64>, maybe_e
     );
 
     let pin = ia32::adjust_vmx_control(ia32::PIN_BASED_NMI_EXITING, unsafe { arch::rdmsr(pin_msr) });
-    let primary_requested =
-        ia32::CPU_BASED_USE_MSR_BITMAPS | ia32::CPU_BASED_ACTIVATE_SECONDARY_CONTROLS;
+    let primary_requested = ia32::CPU_BASED_USE_MSR_BITMAPS
+        | ia32::CPU_BASED_ACTIVATE_SECONDARY_CONTROLS
+        | ia32::CPU_BASED_CPUID_EXITING
+        | ia32::CPU_BASED_HLT_EXITING
+        | ia32::CPU_BASED_RDTSC_EXITING
+        | ia32::CPU_BASED_RDMSR_EXITING
+        | ia32::CPU_BASED_WRMSR_EXITING
+        | ia32::CPU_BASED_CR3_LOAD_EXITING
+        | ia32::CPU_BASED_CR3_STORE_EXITING
+        | ia32::CPU_BASED_CR0_LOAD_EXITING
+        | ia32::CPU_BASED_CR0_STORE_EXITING
+        | ia32::CPU_BASED_CR4_LOAD_EXITING
+        | ia32::CPU_BASED_CR4_STORE_EXITING;
     let primary = ia32::adjust_vmx_control(primary_requested, unsafe { arch::rdmsr(proc_msr) });
     let exit_ctrl = ia32::adjust_vmx_control(
         ia32::EXIT_CONTROL_HOST_ADDR_SPACE_SIZE
             | ia32::EXIT_CONTROL_SAVE_IA32_PAT
-            | ia32::EXIT_CONTROL_LOAD_IA32_PAT,
+            | ia32::EXIT_CONTROL_LOAD_IA32_PAT
+            | ia32::EXIT_CONTROL_SAVE_IA32_EFER
+            | ia32::EXIT_CONTROL_LOAD_IA32_EFER,
         unsafe { arch::rdmsr(exit_msr) },
     );
     let entry_ctrl = ia32::adjust_vmx_control(
-        ia32::ENTRY_CONTROL_IA32E_MODE_GUEST | ia32::ENTRY_CONTROL_LOAD_IA32_PAT,
+        ia32::ENTRY_CONTROL_IA32E_MODE_GUEST
+            | ia32::ENTRY_CONTROL_LOAD_IA32_PAT
+            | ia32::ENTRY_CONTROL_LOAD_IA32_EFER,
         unsafe { arch::rdmsr(entry_msr) },
     );
     let mut secondary_req = ia32::SECONDARY_CONTROL_ENABLE_RDTSCP
@@ -306,6 +507,8 @@ pub unsafe fn configure_host_state(host_rip: u64, host_rsp: u64) -> Result<(), V
     // SAFETY: GDTR/IDTR 是 packed 结构，使用 read_unaligned 读取字段。
     let gdtr_base = unsafe { core::ptr::addr_of!(gdtr.base).read_unaligned() };
     let idtr_base = unsafe { core::ptr::addr_of!(idtr.base).read_unaligned() };
+    let sel = segment::read_segment_selectors();
+    let tr = segment::parse_segment(&gdtr, sel.tr);
     unsafe {
         vmwrite(VmcsField::HOST_CR0, arch::read_cr0())?;
         vmwrite(VmcsField::HOST_CR3, arch::read_cr3())?;
@@ -314,6 +517,34 @@ pub unsafe fn configure_host_state(host_rip: u64, host_rsp: u64) -> Result<(), V
         vmwrite(VmcsField::HOST_RSP, host_rsp)?;
         vmwrite(VmcsField::HOST_GDTR_BASE, gdtr_base)?;
         vmwrite(VmcsField::HOST_IDTR_BASE, idtr_base)?;
+
+        vmwrite(VmcsField::HOST_ES_SELECTOR, sel.es as u64)?;
+        vmwrite(VmcsField::HOST_CS_SELECTOR, sel.cs as u64)?;
+        vmwrite(VmcsField::HOST_SS_SELECTOR, sel.ss as u64)?;
+        vmwrite(VmcsField::HOST_DS_SELECTOR, sel.ds as u64)?;
+        vmwrite(VmcsField::HOST_FS_SELECTOR, sel.fs as u64)?;
+        vmwrite(VmcsField::HOST_GS_SELECTOR, sel.gs as u64)?;
+        vmwrite(VmcsField::HOST_TR_SELECTOR, sel.tr as u64)?;
+
+        vmwrite(VmcsField::HOST_FS_BASE, unsafe { arch::rdmsr(ia32::IA32_FS_BASE) })?;
+        vmwrite(VmcsField::HOST_GS_BASE, unsafe { arch::rdmsr(ia32::IA32_GS_BASE) })?;
+        vmwrite(VmcsField::HOST_TR_BASE, tr.base)?;
+
+        vmwrite(
+            VmcsField::HOST_IA32_SYSENTER_CS,
+            unsafe { arch::rdmsr(ia32::IA32_SYSENTER_CS) } & 0xFFFF,
+        )?;
+        vmwrite(
+            VmcsField::HOST_IA32_SYSENTER_ESP,
+            unsafe { arch::rdmsr(ia32::IA32_SYSENTER_ESP) },
+        )?;
+        vmwrite(
+            VmcsField::HOST_IA32_SYSENTER_EIP,
+            unsafe { arch::rdmsr(ia32::IA32_SYSENTER_EIP) },
+        )?;
+
+        vmwrite(VmcsField::HOST_PAT, unsafe { arch::rdmsr(ia32::IA32_PAT) })?;
+        vmwrite(VmcsField::HOST_EFER, unsafe { arch::read_msr_efer() })?;
     }
     Ok(())
 }

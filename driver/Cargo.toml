@@ -25,6 +25,7 @@ wdk-sys = "0.5.1"
 
 [features]
 default = []
+experimental_vmentry = []
 
 [profile.dev]
 panic = "abort"

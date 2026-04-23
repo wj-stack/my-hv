@@ -40,6 +40,7 @@ mod mm;
 mod segment;
 mod timing;
 mod vmcs;
+mod vmexit;
 mod vcpu;
 mod vmx;
 
@@ -161,6 +162,7 @@ unsafe extern "C" fn dispatch_device_control(
             unsafe { complete_request(irp, STATUS_SUCCESS, input_len) }
         }
         IOCTL_HV_START => {
+            crate::vmexit::install_vmexit_session(SESSION.0.get());
             let status = unsafe {
                 with_session(|session| {
                     if session.is_some() {
@@ -180,6 +182,7 @@ unsafe extern "C" fn dispatch_device_control(
         IOCTL_HV_STOP => {
             let status = unsafe {
                 with_session(|session| {
+                    crate::vmexit::clear_vmexit_session();
                     if let Some(mut c) = session.take() {
                         c.stop();
                     }
@@ -215,6 +218,7 @@ unsafe extern "C" fn dispatch_device_control(
 extern "C" fn driver_unload(driver: *mut DRIVER_OBJECT) {
     unsafe {
         with_session(|session| {
+            crate::vmexit::clear_vmexit_session();
             if let Some(mut c) = session.take() {
                 c.stop();
             }

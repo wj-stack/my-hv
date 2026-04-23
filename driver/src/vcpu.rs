@@ -1,4 +1,4 @@
-//! 每逻辑处理器的 VMXON/VMCS 生命周期。对应 `hv/hv/vcpu.cpp`、`hv/hv/vcpu.h` 中的 `virtualize_cpu` / `stop` 路径（此处不执行 `vmlaunch`）。
+//! 每逻辑处理器的 VMXON/VMCS 生命周期。对应 `hv/hv/vcpu.cpp`、`hv/hv/vcpu.h` 中的 `virtualize_cpu` / `stop` 路径。
 
 use core::mem::size_of;
 
@@ -14,12 +14,17 @@ use crate::exit_handlers;
 use crate::logger;
 use crate::mm::{self, free_contiguous_page};
 use crate::vmcs;
+use crate::vmexit;
 use crate::vmx;
 
 const POOL_TAG: ULONG = u32::from_ne_bytes(*b"HvVc");
-const ENABLE_EXPERIMENTAL_VMENTRY: bool = false;
 
-extern "C" fn vmexit_host_stub() {}
+/// 最小 64 位 guest：`xor rax,rax` → `vmcall` → `jmp $`。
+const GUEST_STUB_CODE: [u8; 8] = [
+    0x48, 0x31, 0xc0, // xor rax, rax
+    0x0f, 0x01, 0xc1, // vmcall
+    0xeb, 0xfe,       // jmp short -2
+];
 
 /// 单 CPU 上的 VMX root 资源。
 pub struct PerCpuState {
@@ -29,6 +34,8 @@ pub struct PerCpuState {
     pub vmcs_phys: u64,
     pub msr_bitmap_page: *mut u8,
     pub msr_bitmap_phys: u64,
+    pub host_stack_page: *mut u8,
+    pub guest_stub_page: *mut u8,
     pub ept: Option<EptState>,
     /// 已成功执行 `VMXON`。
     pub vmxon_done: bool,
@@ -43,6 +50,8 @@ impl PerCpuState {
             vmcs_phys: 0,
             msr_bitmap_page: core::ptr::null_mut(),
             msr_bitmap_phys: 0,
+            host_stack_page: core::ptr::null_mut(),
+            guest_stub_page: core::ptr::null_mut(),
             ept: None,
             vmxon_done: false,
         }
@@ -53,6 +62,8 @@ impl PerCpuState {
             free_contiguous_page(self.vmxon_page);
             free_contiguous_page(self.vmcs_page);
             free_contiguous_page(self.msr_bitmap_page);
+            free_contiguous_page(self.host_stack_page);
+            free_contiguous_page(self.guest_stub_page);
         }
         if let Some(mut ept) = self.ept.take() {
             unsafe { ept.release() };
@@ -60,6 +71,8 @@ impl PerCpuState {
         self.vmxon_page = core::ptr::null_mut();
         self.vmcs_page = core::ptr::null_mut();
         self.msr_bitmap_page = core::ptr::null_mut();
+        self.host_stack_page = core::ptr::null_mut();
+        self.guest_stub_page = core::ptr::null_mut();
         self.msr_bitmap_phys = 0;
         self.vmxon_done = false;
     }
@@ -154,11 +167,32 @@ impl VmxCluster {
             }
             return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
         };
+        let Some(host_stack) = (unsafe { mm::alloc_contiguous_page() }) else {
+            logger::log("failed to allocate host VM-exit stack page");
+            unsafe {
+                free_contiguous_page(vmxon);
+                free_contiguous_page(vmcs);
+                free_contiguous_page(msr_bitmap);
+            }
+            return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
+        };
+        let Some(guest_stub) = (unsafe { mm::alloc_contiguous_page() }) else {
+            logger::log("failed to allocate guest stub page");
+            unsafe {
+                free_contiguous_page(vmxon);
+                free_contiguous_page(vmcs);
+                free_contiguous_page(msr_bitmap);
+                free_contiguous_page(host_stack);
+            }
+            return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
+        };
 
         unsafe {
             vmcs::prepare_vmxon_region(vmxon);
             vmcs::prepare_vmcs_region(vmcs);
             core::ptr::write_bytes(msr_bitmap, 0xFF, 4096);
+            core::ptr::write_bytes(host_stack, 0xCC, 4096);
+            core::ptr::copy_nonoverlapping(GUEST_STUB_CODE.as_ptr(), guest_stub, GUEST_STUB_CODE.len());
         }
 
         let Some(fixed) = VmxFixedMsrs::read() else {
@@ -167,6 +201,8 @@ impl VmxCluster {
                 free_contiguous_page(vmxon);
                 free_contiguous_page(vmcs);
                 free_contiguous_page(msr_bitmap);
+                free_contiguous_page(host_stack);
+                free_contiguous_page(guest_stub);
             }
             return wdk_sys::STATUS_NOT_SUPPORTED;
         };
@@ -177,6 +213,8 @@ impl VmxCluster {
                 free_contiguous_page(vmxon);
                 free_contiguous_page(vmcs);
                 free_contiguous_page(msr_bitmap);
+                free_contiguous_page(host_stack);
+                free_contiguous_page(guest_stub);
             }
             return wdk_sys::STATUS_NOT_SUPPORTED;
         }
@@ -192,6 +230,8 @@ impl VmxCluster {
         cpu.vmcs_phys = vmcs_phys;
         cpu.msr_bitmap_page = msr_bitmap;
         cpu.msr_bitmap_phys = msr_bitmap_phys;
+        cpu.host_stack_page = host_stack;
+        cpu.guest_stub_page = guest_stub;
         cpu.ept = ept;
 
         if !unsafe { vmx::vmxon(&raw const cpu.vmxon_phys) } {
@@ -250,10 +290,9 @@ impl VmxCluster {
             }
         }
 
-        let host_rsp = cpu.vmcs_page as u64 + 4096 - 0x20;
-        if let Err(err) = unsafe {
-            vmcs::configure_host_state(vmexit_host_stub as *const () as usize as u64, host_rsp)
-        } {
+        let host_rsp = host_stack as u64 + 4096 - 0x20;
+        let host_entry = vmexit::vmexit_host_stub as *const () as usize as u64;
+        if let Err(err) = unsafe { vmcs::configure_host_state(host_entry, host_rsp) } {
             logger::log_vmcs_error("configure_host_state", vmcs::VmcsField::HOST_RIP, err);
             let _ = unsafe { vmx::vmxoff() };
             unsafe {
@@ -273,8 +312,24 @@ impl VmxCluster {
             return wdk_sys::STATUS_UNSUCCESSFUL;
         }
 
-        if let Err(err) = unsafe { vmcs::seed_minimal_guest_state() } {
-            logger::log_vmcs_error("seed_minimal_guest_state", vmcs::VmcsField::GUEST_RFLAGS, err);
+        if let Err(err) = unsafe { vmcs::configure_guest_segment_state() } {
+            logger::log_vmcs_error(
+                "configure_guest_segment_state",
+                vmcs::VmcsField::GUEST_CS_SELECTOR,
+                err,
+            );
+            let _ = unsafe { vmx::vmxoff() };
+            unsafe {
+                arch::disable_vmx_hardware();
+                cpu.free_pages();
+            }
+            return wdk_sys::STATUS_UNSUCCESSFUL;
+        }
+
+        let guest_rip = guest_stub as u64;
+        let guest_rsp = guest_stub as u64 + 0xFF0u64;
+        if let Err(err) = unsafe { vmcs::seed_guest_entry_state(guest_rip, guest_rsp, 0x2) } {
+            logger::log_vmcs_error("seed_guest_entry_state", vmcs::VmcsField::GUEST_RFLAGS, err);
             let _ = unsafe { vmx::vmxoff() };
             unsafe {
                 arch::disable_vmx_hardware();
@@ -322,22 +377,14 @@ impl VmxCluster {
                     reason,
                     guest_rip: 0,
                     guest_rsp: 0,
-                    guest_rflags: guest_rflags,
+                    guest_rflags,
                 };
-                let mut no_cluster = None;
-                let _ = exit_handlers::dispatch_vm_exit(&mut no_cluster, &ctx, 0, [0; 6]);
+                if let Some(opt) = peek_session_for_dispatch() {
+                    let _ = exit_handlers::dispatch_vm_exit(opt, &ctx, 0, [0; 6]);
+                }
             }
             Err(err) => {
                 logger::log_vmcs_error("vmread(EXIT_REASON)", vmcs::VmcsField::EXIT_REASON, err);
-            }
-        }
-
-        if ENABLE_EXPERIMENTAL_VMENTRY {
-            let launched = unsafe { vmx::vmlaunch() };
-            if !launched {
-                logger::log("vmlaunch returned failure");
-            } else {
-                let _ = unsafe { vmx::vmresume() };
             }
         }
 
@@ -390,4 +437,18 @@ impl VmxCluster {
         unsafe { cpu.free_pages() };
         *cpu = PerCpuState::empty();
     }
+}
+
+/// 供 bring-up 诊断路径在无 `VMEXIT_SESSION` 时读取 `Option<VmxCluster>`（与 `install_vmexit_session` 指向同一块内存）。
+pub fn peek_session_for_dispatch() -> Option<&'static mut Option<VmxCluster>> {
+    vmexit::peek_session_option_mut()
+}
+
+/// 在当前逻辑处理器上尝试 `VMLAUNCH`（成功则进入 guest，通常**不会**返回到此函数）。
+///
+/// 需已加载本驱动并完成 `IOCTL_HV_START`，且当前线程亲和到目标 CPU。仅 `--features experimental_vmentry` 可用。
+#[cfg(feature = "experimental_vmentry")]
+#[allow(dead_code)]
+pub unsafe fn debug_vmlaunch_on_this_cpu() -> bool {
+    unsafe { vmx::vmlaunch() }
 }
