@@ -70,6 +70,7 @@ pub const VMX_EXIT_REASON_VMX_PREEMPTION_TIMER: u32 = 52;
 pub const MAXULONG64: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 
 /// 异常向量（#UD=6, #GP=13, #PF=14）。
+pub const X86_VECTOR_NMI: u32 = 2;
 pub const X86_VECTOR_UD: u32 = 6;
 pub const X86_VECTOR_GP: u32 = 13;
 pub const X86_VECTOR_PF: u32 = 14;
@@ -212,20 +213,32 @@ pub const VMX_BASIC_TRUE_CTLS: u64 = 1 << 55;
 pub const PIN_BASED_NMI_EXITING: u32 = 1 << 3;
 pub const PIN_BASED_VIRTUAL_NMI: u32 = 1 << 5;
 pub const PIN_BASED_ACTIVATE_VMX_PREEMPTION_TIMER: u32 = 1 << 6;
+
+// Primary processor-based VM-execution controls — Intel SDM Vol.3C Table 25-6
+// （与 `hv/extern/ia32-doc/out/ia32.h` 中 `IA32_VMX_PROCBASED_CTLS_*` 一致）
+pub const CPU_BASED_INTERRUPT_WINDOW_EXITING: u32 = 1 << 2;
 pub const CPU_BASED_USE_TSC_OFFSETTING: u32 = 1 << 3;
-pub const CPU_BASED_NMI_WINDOW_EXITING: u32 = 1 << 22;
-pub const CPU_BASED_USE_MSR_BITMAPS: u32 = 1 << 28;
-pub const CPU_BASED_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
-pub const CPU_BASED_CPUID_EXITING: u32 = 1 << 10;
 pub const CPU_BASED_HLT_EXITING: u32 = 1 << 7;
+pub const CPU_BASED_INVLPG_EXITING: u32 = 1 << 9;
+pub const CPU_BASED_MWAIT_EXITING: u32 = 1 << 10;
+pub const CPU_BASED_RDPMC_EXITING: u32 = 1 << 11;
 pub const CPU_BASED_RDTSC_EXITING: u32 = 1 << 12;
-pub const CPU_BASED_RDMSR_EXITING: u32 = 1 << 13;
-pub const CPU_BASED_WRMSR_EXITING: u32 = 1 << 14;
 pub const CPU_BASED_CR3_LOAD_EXITING: u32 = 1 << 15;
-pub const CPU_BASED_CR0_LOAD_EXITING: u32 = 1 << 19;
-pub const CPU_BASED_CR0_STORE_EXITING: u32 = 1 << 20;
-pub const CPU_BASED_CR4_LOAD_EXITING: u32 = 1 << 21;
-pub const CPU_BASED_CR4_STORE_EXITING: u32 = 1 << 22;
+pub const CPU_BASED_CR3_STORE_EXITING: u32 = 1 << 16;
+/// Bit 17：启用 tertiary processor-based controls（若 CPU 支持）。
+pub const CPU_BASED_ACTIVATE_TERTIARY_CONTROLS: u32 = 1 << 17;
+pub const CPU_BASED_CR8_LOAD_EXITING: u32 = 1 << 19;
+pub const CPU_BASED_CR8_STORE_EXITING: u32 = 1 << 20;
+pub const CPU_BASED_USE_TPR_SHADOW: u32 = 1 << 21;
+pub const CPU_BASED_NMI_WINDOW_EXITING: u32 = 1 << 22;
+pub const CPU_BASED_MOV_DR_EXITING: u32 = 1 << 23;
+pub const CPU_BASED_UNCONDITIONAL_IO_EXITING: u32 = 1 << 24;
+pub const CPU_BASED_USE_IO_BITMAPS: u32 = 1 << 25;
+pub const CPU_BASED_MONITOR_TRAP_FLAG: u32 = 1 << 27;
+pub const CPU_BASED_USE_MSR_BITMAPS: u32 = 1 << 28;
+pub const CPU_BASED_MONITOR_EXITING: u32 = 1 << 29;
+pub const CPU_BASED_PAUSE_EXITING: u32 = 1 << 30;
+pub const CPU_BASED_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
 pub const EXIT_CONTROL_HOST_ADDR_SPACE_SIZE: u32 = 1 << 9;
 pub const EXIT_CONTROL_SAVE_DEBUG_CONTROLS: u32 = 1 << 2;
 pub const EXIT_CONTROL_SAVE_IA32_PAT: u32 = 1 << 18;

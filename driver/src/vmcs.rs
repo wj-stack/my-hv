@@ -476,19 +476,15 @@ pub unsafe fn configure_control_fields(params: &VmcsControlParams) -> Result<(),
         | ia32::PIN_BASED_ACTIVATE_VMX_PREEMPTION_TIMER;
     let pin = ia32::adjust_vmx_control(pin_req, unsafe { arch::rdmsr(pin_msr) });
 
+    // CPUID：SDM 25.1.3 列在「无条件 VM-exit」类指令中，无 primary 控制位。
+    // RDMSR/WRMSR：由 `USE_MSR_BITMAPS` + MSR 位图决定，无独立 RDMSR/WRMSR 位（bit 13–14 为保留）。
+    // MOV CR0/CR4：由 guest/host mask 与 read shadow 等决定 VM-exit，非旧版误用的 bit 19–21。
     let primary_requested = ia32::CPU_BASED_USE_MSR_BITMAPS
         | ia32::CPU_BASED_ACTIVATE_SECONDARY_CONTROLS
         | ia32::CPU_BASED_USE_TSC_OFFSETTING
-        | ia32::CPU_BASED_CPUID_EXITING
         | ia32::CPU_BASED_HLT_EXITING
         | ia32::CPU_BASED_RDTSC_EXITING
-        | ia32::CPU_BASED_RDMSR_EXITING
-        | ia32::CPU_BASED_WRMSR_EXITING
-        | ia32::CPU_BASED_CR3_LOAD_EXITING
-        | ia32::CPU_BASED_CR0_LOAD_EXITING
-        | ia32::CPU_BASED_CR0_STORE_EXITING
-        | ia32::CPU_BASED_CR4_LOAD_EXITING
-        | ia32::CPU_BASED_CR4_STORE_EXITING;
+        | ia32::CPU_BASED_CR3_LOAD_EXITING;
     let primary = ia32::adjust_vmx_control(primary_requested, unsafe { arch::rdmsr(proc_msr) });
 
     let exit_ctrl = ia32::adjust_vmx_control(

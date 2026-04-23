@@ -4,7 +4,14 @@
 use crate::ia32;
 use crate::vmcs::{self, VmcsField};
 
-/// SDM 表 6-1：类型 3 = 硬件异常；valid=31；有 error 时置 bit 11。
+/// SDM 表 24-15：类型 2 = NMI；向量固定为 2。
+pub unsafe fn inject_nmi() {
+    let info = (0x8000_0000u32 | 2u32 << 8 | (ia32::X86_VECTOR_NMI & 0xFF)) as u64;
+    let _ = vmcs::vmwrite(VmcsField::VMENTRY_INTERRUPTION_INFO, info);
+    let _ = vmcs::vmwrite(VmcsField::VMENTRY_EXCEPTION_ERROR_CODE, 0);
+}
+
+/// SDM 表 24-15：类型 3 = 硬件异常；valid=31；有 error 时置 bit 11。
 unsafe fn vmentry_interruption_info(vector: u32, error_code: Option<u32>) -> u32 {
     let mut v = 0x8000_0000u32 | 3u32 << 8 | (vector & 0xFF);
     if let Some(_e) = error_code {

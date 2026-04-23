@@ -45,6 +45,46 @@ fn advance_guest_rip(len: u64) {
     }
 }
 
+/// 与 `hv/hv/exit-handlers.cpp` 的 `handle_nmi_window` 一致。
+fn handle_nmi_window(cl: &mut VmxCluster) {
+    let Some(cpu) = cl.current_cpu_mut() else {
+        return;
+    };
+    if cpu.queued_nmis == 0 {
+        logger::log("VM-exit: NMI_WINDOW with queued_nmis==0");
+        if let Ok(ctrl) = unsafe { vmcs::vmread(VmcsField::CTRL_CPU_BASED) } {
+            let cleared = ctrl & !u64::from(ia32::CPU_BASED_NMI_WINDOW_EXITING);
+            let _ = unsafe { vmcs::vmwrite(VmcsField::CTRL_CPU_BASED, cleared) };
+        }
+        return;
+    }
+    cpu.queued_nmis -= 1;
+    unsafe { exception_inject::inject_nmi() };
+    let Ok(ctrl) = (unsafe { vmcs::vmread(VmcsField::CTRL_CPU_BASED) }) else {
+        return;
+    };
+    let mask = u64::from(ia32::CPU_BASED_NMI_WINDOW_EXITING);
+    let new_ctrl = if cpu.queued_nmis > 0 {
+        ctrl | mask
+    } else {
+        ctrl & !mask
+    };
+    let _ = unsafe { vmcs::vmwrite(VmcsField::CTRL_CPU_BASED, new_ctrl) };
+}
+
+/// 与 `hv/hv/exit-handlers.cpp` 的 `handle_exception_or_nmi` 一致（虚拟 NMI 排队）。
+fn handle_exception_or_nmi(cl: &mut VmxCluster) {
+    let Some(cpu) = cl.current_cpu_mut() else {
+        return;
+    };
+    cpu.queued_nmis = cpu.queued_nmis.saturating_add(1);
+    let Ok(ctrl) = (unsafe { vmcs::vmread(VmcsField::CTRL_CPU_BASED) }) else {
+        return;
+    };
+    let new_ctrl = ctrl | u64::from(ia32::CPU_BASED_NMI_WINDOW_EXITING);
+    let _ = unsafe { vmcs::vmwrite(VmcsField::CTRL_CPU_BASED, new_ctrl) };
+}
+
 /// 当 VM-exit 原因为 `VMCALL` 时，复用 `hypercalls::dispatch`。
 pub fn dispatch_vm_exit_hypercall(
     cluster: &mut Option<VmxCluster>,
@@ -217,14 +257,19 @@ pub fn dispatch_vm_exit(
     let basic = u32::from(reason.basic);
     match basic {
         ia32::VMX_EXIT_REASON_EXCEPTION_NMI => {
-            logger::log("VM-exit: EXCEPTION_NMI (stub)");
-            unsafe { exception_inject::inject_general_protection_0() };
+            logger::log("VM-exit: EXCEPTION_OR_NMI -> queue NMI");
+            if let Some(c) = cluster.as_mut() {
+                handle_exception_or_nmi(c);
+            }
         }
         ia32::VMX_EXIT_REASON_VMX_GETSEC | ia32::VMX_EXIT_REASON_INVD => {
             unsafe { exception_inject::inject_general_protection_0() };
         }
         ia32::VMX_EXIT_REASON_NMI_WINDOW => {
             logger::log("VM-exit: NMI_WINDOW");
+            if let Some(c) = cluster.as_mut() {
+                handle_nmi_window(c);
+            }
         }
         ia32::VMX_EXIT_REASON_CPUID => handle_cpuid(regs),
         ia32::VMX_EXIT_REASON_MOV_CR => handle_mov_cr(regs, guest_rsp),
