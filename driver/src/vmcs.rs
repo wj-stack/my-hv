@@ -298,20 +298,6 @@ pub unsafe fn vmread(field: VmcsField) -> Result<u64, VmcsAccessError> {
     }
 }
 
-/// 写入 guest RIP/RSP/RFLAGS、CR3 与 CR 影子，供 `VMLAUNCH`/`VMRESUME` 使用。
-///
-/// # Safety
-/// 调用前必须已 `VMPTRLD` 当前 VMCS，且运行在 VMX root。
-pub unsafe fn seed_guest_entry_state(rip: u64, rsp: u64, rflags: u64) -> Result<(), VmcsAccessError> {
-    unsafe { vmwrite(VmcsField::GUEST_CR3, arch::read_cr3())? };
-    unsafe { vmwrite(VmcsField::GUEST_RIP, rip)? };
-    unsafe { vmwrite(VmcsField::GUEST_RSP, rsp)? };
-    unsafe { vmwrite(VmcsField::GUEST_RFLAGS, rflags)? };
-    unsafe { vmwrite(VmcsField::CTRL_CR0_READ_SHADOW, arch::read_cr0())? };
-    unsafe { vmwrite(VmcsField::CTRL_CR4_READ_SHADOW, arch::read_cr4() & !CR4_VMXE)? };
-    Ok(())
-}
-
 #[inline]
 unsafe fn vmwrite_segment(
     selector: VmcsField,
@@ -329,7 +315,7 @@ unsafe fn vmwrite_segment(
     Ok(())
 }
 
-/// Guest 段、GDTR/IDTR、SYSENTER、DEBUGCTL/PAT/EFER 镜像当前 CPU。
+/// Guest 段、GDTR/IDTR、SYSENTER、DEBUGCTL/PAT 镜像当前 CPU（与 `hv/vmcs.cpp::write_vmcs_guest_fields` 一致，不单独写 `GUEST_EFER`）。
 ///
 /// # Safety
 /// 需要已 `VMPTRLD`。
@@ -431,7 +417,6 @@ pub unsafe fn configure_guest_segment_state() -> Result<(), VmcsAccessError> {
 
         vmwrite(VmcsField::GUEST_DEBUGCTL, unsafe { arch::rdmsr(ia32::IA32_DEBUGCTL) })?;
         vmwrite(VmcsField::GUEST_PAT, unsafe { arch::rdmsr(ia32::IA32_PAT) })?;
-        vmwrite(VmcsField::GUEST_EFER, unsafe { arch::read_msr_efer() })?;
 
         vmwrite(VmcsField::GUEST_INTERRUPTIBILITY_STATE, 0)?;
         vmwrite(VmcsField::GUEST_ACTIVITY_STATE, 0)?;
@@ -476,14 +461,10 @@ pub unsafe fn configure_control_fields(params: &VmcsControlParams) -> Result<(),
         | ia32::PIN_BASED_ACTIVATE_VMX_PREEMPTION_TIMER;
     let pin = ia32::adjust_vmx_control(pin_req, unsafe { arch::rdmsr(pin_msr) });
 
-    // CPUID：SDM 25.1.3 列在「无条件 VM-exit」类指令中，无 primary 控制位。
-    // RDMSR/WRMSR：由 `USE_MSR_BITMAPS` + MSR 位图决定，无独立 RDMSR/WRMSR 位（bit 13–14 为保留）。
-    // MOV CR0/CR4：由 guest/host mask 与 read shadow 等决定 VM-exit，非旧版误用的 bit 19–21。
+    // 与 `hv/vmcs.cpp` 一致：primary 仅 CR3-load exiting + MSR 位图 + TSC offset + secondary。
     let primary_requested = ia32::CPU_BASED_USE_MSR_BITMAPS
         | ia32::CPU_BASED_ACTIVATE_SECONDARY_CONTROLS
         | ia32::CPU_BASED_USE_TSC_OFFSETTING
-        | ia32::CPU_BASED_HLT_EXITING
-        | ia32::CPU_BASED_RDTSC_EXITING
         | ia32::CPU_BASED_CR3_LOAD_EXITING;
     let primary = ia32::adjust_vmx_control(primary_requested, unsafe { arch::rdmsr(proc_msr) });
 
@@ -492,23 +473,24 @@ pub unsafe fn configure_control_fields(params: &VmcsControlParams) -> Result<(),
             | ia32::EXIT_CONTROL_SAVE_DEBUG_CONTROLS
             | ia32::EXIT_CONTROL_SAVE_IA32_PAT
             | ia32::EXIT_CONTROL_LOAD_IA32_PAT
-            | ia32::EXIT_CONTROL_SAVE_IA32_EFER
-            | ia32::EXIT_CONTROL_LOAD_IA32_EFER
-            | ia32::EXIT_CONTROL_LOAD_IA32_PERF_GLOBAL_CTRL,
+            | ia32::EXIT_CONTROL_LOAD_IA32_PERF_GLOBAL_CTRL
+            | ia32::EXIT_CONTROL_CONCEAL_VMX_FROM_PT,
         unsafe { arch::rdmsr(exit_msr) },
     );
     let entry_ctrl = ia32::adjust_vmx_control(
         ia32::ENTRY_CONTROL_IA32E_MODE_GUEST
             | ia32::ENTRY_CONTROL_LOAD_DEBUG_CONTROLS
             | ia32::ENTRY_CONTROL_LOAD_IA32_PAT
-            | ia32::ENTRY_CONTROL_LOAD_IA32_EFER
-            | ia32::ENTRY_CONTROL_LOAD_IA32_PERF_GLOBAL_CTRL,
+            | ia32::ENTRY_CONTROL_LOAD_IA32_PERF_GLOBAL_CTRL
+            | ia32::ENTRY_CONTROL_CONCEAL_VMX_FROM_PT,
         unsafe { arch::rdmsr(entry_msr) },
     );
 
     let mut secondary_req = ia32::SECONDARY_CONTROL_ENABLE_RDTSCP
         | ia32::SECONDARY_CONTROL_ENABLE_INVPCID
-        | ia32::SECONDARY_CONTROL_ENABLE_XSAVES_XRSTORS;
+        | ia32::SECONDARY_CONTROL_ENABLE_XSAVES_XRSTORS
+        | ia32::SECONDARY_CONTROL_ENABLE_USER_WAIT_PAUSE
+        | ia32::SECONDARY_CONTROL_CONCEAL_VMX_FROM_PT;
     if params.eptp.is_some() {
         secondary_req |= ia32::SECONDARY_CONTROL_ENABLE_EPT | ia32::SECONDARY_CONTROL_ENABLE_VPID;
     }
@@ -517,8 +499,18 @@ pub unsafe fn configure_control_fields(params: &VmcsControlParams) -> Result<(),
         unsafe { arch::rdmsr(ia32::IA32_VMX_PROCBASED_CTLS2) },
     );
 
-    let cr0_mask = !0u64;
-    let cr4_mask = !0u64;
+    let (cr0_mask, cr4_mask) = if cfg!(debug_assertions) {
+        (!0u64, !0u64)
+    } else {
+        let cr0_fixed0 = unsafe { arch::rdmsr(ia32::IA32_VMX_CR0_FIXED0) };
+        let cr0_fixed1 = unsafe { arch::rdmsr(ia32::IA32_VMX_CR0_FIXED1) };
+        let cr4_fixed0 = unsafe { arch::rdmsr(ia32::IA32_VMX_CR4_FIXED0) };
+        let cr4_fixed1 = unsafe { arch::rdmsr(ia32::IA32_VMX_CR4_FIXED1) };
+        (
+            cr0_fixed0 | !cr0_fixed1 | ia32::CR0_CACHE_DISABLE_FLAG | ia32::CR0_WRITE_PROTECT_FLAG,
+            cr4_fixed0 | !cr4_fixed1,
+        )
+    };
 
     unsafe {
         vmwrite(VmcsField::CTRL_PIN_BASED, pin as u64)?;
@@ -670,13 +662,14 @@ pub unsafe fn configure_host_state(layout: &HostVmcsLayout) -> Result<(), VmcsAc
         vmwrite(VmcsField::HOST_IA32_SYSENTER_EIP, 0)?;
 
         vmwrite(VmcsField::HOST_PAT, HOST_PAT_RESET)?;
-        vmwrite(VmcsField::HOST_EFER, arch::read_msr_efer())?;
         vmwrite(VmcsField::HOST_IA32_PERF_GLOBAL_CTRL, 0)?;
     }
     Ok(())
 }
 
 /// 写入最小 guest 字段。
+///
+/// `GUEST_RIP`/`GUEST_RSP` 先置 0，由 `hv_vm_launch` 在 `VMLAUNCH` 前写入（与 `hv/vmcs.cpp` + `vm-launch.asm` 一致）。
 ///
 /// # Safety
 /// 需要已 `VMPTRLD`。
@@ -686,6 +679,9 @@ pub unsafe fn configure_guest_state() -> Result<(), VmcsAccessError> {
         vmwrite(VmcsField::GUEST_CR3, arch::read_cr3())?;
         vmwrite(VmcsField::GUEST_CR4, arch::read_cr4())?;
         vmwrite(VmcsField::GUEST_DR7, arch::read_dr7())?;
+        vmwrite(VmcsField::GUEST_RSP, 0)?;
+        vmwrite(VmcsField::GUEST_RIP, 0)?;
+        vmwrite(VmcsField::GUEST_RFLAGS, arch::read_rflags())?;
         vmwrite(
             VmcsField::GUEST_IA32_PERF_GLOBAL_CTRL,
             arch::rdmsr(ia32::IA32_PERF_GLOBAL_CTRL),

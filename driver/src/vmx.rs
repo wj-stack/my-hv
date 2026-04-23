@@ -140,3 +140,24 @@ pub unsafe fn invept_single_context(eptp: u64) -> bool {
     }
     ok != 0
 }
+
+/// `invept_all_context`（`hv` 中 `invept_type::invept_all_context` = 2），在 `VMXON` 后使全局 EPT 缓存失效。
+#[inline]
+pub unsafe fn invept_all_contexts() -> bool {
+    let desc = InveptDescriptor {
+        eptp: 0,
+        reserved: 0,
+    };
+    let mut ok: u8;
+    unsafe {
+        core::arch::asm!(
+            "invept rcx, xmmword ptr [rax]",
+            "setnc {ok}",
+            in("rax") &raw const desc,
+            in("rcx") 2u64,
+            ok = out(reg_byte) ok,
+            options(nostack),
+        );
+    }
+    ok != 0
+}

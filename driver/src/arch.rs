@@ -67,6 +67,16 @@ pub fn read_cr4() -> u64 {
     v
 }
 
+/// 与 `hv` 中 `__readeflags()` / `RFLAGS` 一致。
+#[inline]
+pub fn read_rflags() -> u64 {
+    let v: u64;
+    unsafe {
+        core::arch::asm!("pushfq", "pop {v}", v = out(reg) v);
+    }
+    v
+}
+
 /// 当前 `DR7`（与 `hv/hv/vmcs.cpp::write_vmcs_guest_fields` 中 `__readdr(7)` 一致）。
 pub fn read_dr7() -> u64 {
     let v: u64;

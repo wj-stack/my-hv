@@ -12,6 +12,8 @@ pub const EPT_MEMTYPE_WB: u64 = 6;
 const EPT_R: u64 = 1;
 const EPT_W: u64 = 2;
 const EPT_X: u64 = 4;
+/// 与 `hv/hv/ept.cpp` 中 `user_mode_execute = 1` 对应（EPT 大页项 bit 10）。
+const EPT_USER_MODE_EXECUTE: u64 = 1 << 10;
 /// 非叶表项：bits 2:0 不能全为 1（全 1 表示叶项映射页）。
 const EPT_NONLEAF: u64 = EPT_R | EPT_W;
 const EPT_LARGE: u64 = 1 << 7;
@@ -74,7 +76,7 @@ pub struct EptState {
 fn ept_leaf_2mb_from_mtrr(gpa: u64, m: &mtrr::MtrrData) -> u64 {
     let aligned = gpa & !(SIZE_2M - 1);
     let mt = u64::from(mtrr::calc_mtrr_mem_type(m, gpa, SIZE_2M)) & 0x7;
-    aligned | EPT_R | EPT_W | EPT_X | EPT_LARGE | (mt << 3)
+    aligned | EPT_R | EPT_W | EPT_X | EPT_USER_MODE_EXECUTE | EPT_LARGE | (mt << 3)
 }
 
 impl EptState {

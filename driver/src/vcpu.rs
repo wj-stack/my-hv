@@ -5,11 +5,16 @@ use alloc::boxed::Box;
 use core::mem::size_of;
 
 use wdk_sys::ntddk::{
-    ExAllocatePool2, ExFreePoolWithTag, KeGetCurrentProcessorNumberEx, KeQueryActiveProcessorCountEx,
-    KeRevertToUserAffinityThreadEx, KeSetSystemAffinityThreadEx,
+    ExAllocatePool2, ExFreePoolWithTag, KeGetCurrentProcessorNumberEx, KeRevertToUserAffinityThreadEx,
+    KeSetSystemAffinityThreadEx,
 };
 use wdk_sys::PROCESSOR_NUMBER;
 use wdk_sys::{NTSTATUS, POOL_FLAG_NON_PAGED, SIZE_T, ULONG};
+
+unsafe extern "system" {
+    /// 与 `hv/hv/hv.cpp` 中 `KeQueryActiveProcessorCount(nullptr)` 一致。
+    fn KeQueryActiveProcessorCount(active_processors: *mut core::ffi::c_void) -> u16;
+}
 
 use crate::arch::{self, VmxFixedMsrs};
 use crate::ept::EptState;
@@ -28,6 +33,9 @@ use shared_contract::{HypercallCode, HYPERCALL_KEY, HYPERVISOR_SIGNATURE};
 
 const POOL_TAG: ULONG = u32::from_ne_bytes(*b"HvVc");
 
+/// 与 `hv/hv/vcpu.h` 中 `guest_vpid` 一致。
+const GUEST_VPID: u16 = 1;
+
 
 fn fill_vcpu_cache(cpu: &mut PerCpuState) {
     let feature_control = unsafe { arch::rdmsr(ia32::IA32_FEATURE_CONTROL) };
@@ -44,7 +52,6 @@ fn fill_vcpu_cache(cpu: &mut PerCpuState) {
     cpu.cache.vmx_misc = vmx_misc;
 }
 
-/// 最小 64 位 guest：`xor rax,rax` → `vmcall` → `jmp $`。
 /// 与 `hv/hv/vcpu.cpp` 中 `cache_cpu_data` / `vcpu_cached_data` 对齐的可见字段子集。
 #[derive(Clone, Copy, Debug)]
 pub struct VcpuCache {
@@ -73,12 +80,6 @@ impl VcpuCache {
     }
 }
 
-const GUEST_STUB_CODE: [u8; 8] = [
-    0x48, 0x31, 0xc0, // xor rax, rax
-    0x0f, 0x01, 0xc1, // vmcall
-    0xeb, 0xfe,       // jmp short -2
-];
-
 /// 单 CPU 上的 VMX root 资源。
 pub struct PerCpuState {
     pub vmxon_page: *mut u8,
@@ -88,7 +89,6 @@ pub struct PerCpuState {
     pub msr_bitmap_page: *mut u8,
     pub msr_bitmap_phys: u64,
     pub host_stack_page: *mut u8,
-    pub guest_stub_page: *mut u8,
     /// MSR 自动存/装列表（`hv` 的 `msr_exit_store` + `msr_entry_load`），单页。
     pub msr_auto_page: *mut u8,
     /// `prepare_host_idt`：256 项 × 16 字节。
@@ -114,7 +114,6 @@ impl PerCpuState {
             msr_bitmap_page: core::ptr::null_mut(),
             msr_bitmap_phys: 0,
             host_stack_page: core::ptr::null_mut(),
-            guest_stub_page: core::ptr::null_mut(),
             msr_auto_page: core::ptr::null_mut(),
             host_idt_page: core::ptr::null_mut(),
             host_gdt_tss_page: core::ptr::null_mut(),
@@ -131,7 +130,6 @@ impl PerCpuState {
             free_contiguous_page(self.vmcs_page);
             free_contiguous_page(self.msr_bitmap_page);
             free_contiguous_page(self.host_stack_page);
-            free_contiguous_page(self.guest_stub_page);
             free_contiguous_page(self.msr_auto_page);
             free_contiguous_page(self.host_idt_page);
             free_contiguous_page(self.host_gdt_tss_page);
@@ -143,7 +141,6 @@ impl PerCpuState {
         self.vmcs_page = core::ptr::null_mut();
         self.msr_bitmap_page = core::ptr::null_mut();
         self.host_stack_page = core::ptr::null_mut();
-        self.guest_stub_page = core::ptr::null_mut();
         self.msr_auto_page = core::ptr::null_mut();
         self.host_idt_page = core::ptr::null_mut();
         self.host_gdt_tss_page = core::ptr::null_mut();
@@ -178,7 +175,7 @@ impl VmxCluster {
         }
     }
 
-    /// 在组 0 的每个逻辑处理器上执行 `VMXON` + `VMCLEAR`/`VMPTRLD`。
+    /// 在每个活动逻辑处理器上执行 `VMXON` + `VMCLEAR`/`VMPTRLD`（与 `hv::start` 使用 `KeQueryActiveProcessorCount(nullptr)` 一致）。
     ///
     /// # Safety
     /// 调用方必须处于 `IRQL <= APC_LEVEL`（与 `KeSetSystemAffinityThreadEx` 要求一致）。
@@ -188,9 +185,14 @@ impl VmxCluster {
             return Err(wdk_sys::STATUS_NOT_SUPPORTED);
         }
 
-        let count = unsafe { KeQueryActiveProcessorCountEx(0) };
+        if !unsafe { introspection::find_offsets() } {
+            logger::log("find_offsets failed (Ps* opcode probe)");
+            return Err(wdk_sys::STATUS_UNSUCCESSFUL);
+        }
+
+        let count = unsafe { KeQueryActiveProcessorCount(core::ptr::null_mut()) } as u32;
         if count == 0 {
-            logger::log("no active processors in group 0");
+            logger::log("no active processors");
             return Err(wdk_sys::STATUS_UNSUCCESSFUL);
         }
 
@@ -217,7 +219,7 @@ impl VmxCluster {
             host_page_tables: None,
         };
 
-        let system_cr3 = introspection::query_process_cr3(4).unwrap_or_else(arch::read_cr3);
+        let system_cr3 = introspection::system_cr3().unwrap_or_else(arch::read_cr3);
         let Some(host_pt) = HostPageTables::prepare(system_cr3) else {
             logger::log("prepare HostPageTables failed");
             unsafe { ExFreePoolWithTag(cpus.cast(), POOL_TAG) };
@@ -273,16 +275,6 @@ impl VmxCluster {
             }
             return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
         };
-        let Some(guest_stub) = (unsafe { mm::alloc_contiguous_page() }) else {
-            logger::log("failed to allocate guest stub page");
-            unsafe {
-                free_contiguous_page(vmxon);
-                free_contiguous_page(vmcs);
-                free_contiguous_page(msr_bitmap);
-                free_contiguous_page(host_stack);
-            }
-            return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
-        };
         let Some(msr_auto) = (unsafe { mm::alloc_contiguous_page() }) else {
             logger::log("failed to allocate MSR auto-load/store page");
             unsafe {
@@ -290,7 +282,6 @@ impl VmxCluster {
                 free_contiguous_page(vmcs);
                 free_contiguous_page(msr_bitmap);
                 free_contiguous_page(host_stack);
-                free_contiguous_page(guest_stub);
             }
             return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
         };
@@ -301,7 +292,6 @@ impl VmxCluster {
                 free_contiguous_page(vmcs);
                 free_contiguous_page(msr_bitmap);
                 free_contiguous_page(host_stack);
-                free_contiguous_page(guest_stub);
                 free_contiguous_page(msr_auto);
             }
             return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
@@ -313,7 +303,6 @@ impl VmxCluster {
                 free_contiguous_page(vmcs);
                 free_contiguous_page(msr_bitmap);
                 free_contiguous_page(host_stack);
-                free_contiguous_page(guest_stub);
                 free_contiguous_page(msr_auto);
                 free_contiguous_page(host_idt);
             }
@@ -331,12 +320,8 @@ impl VmxCluster {
             vmcs::prepare_vmcs_region(vmcs);
             // 整页 MSR 位图：默认不拦截；对 FEATURE_CONTROL 读与 MTRR 相关写置位以在 guest 访问时 VM-exit。
             msr_bitmap::prepare_msr_bitmap_page(msr_bitmap);
-            // Host VM-exit 处理栈。参考工程在 `virtualize_cpu` 开头 `memset(cpu,0,...)` 把 `host_stack` 清零；
-            // 这里用 0xCC（INT3）填满一页，便于栈下溢或未初始化使用时立刻断在调试器里。
-            core::ptr::write_bytes(host_stack, 0xCC, 4096);
-            // 参考 HV 的 guest 初始 RIP 来自 `write_vmcs_guest_fields()`（当前内核上下文）；本驱动改为映射到
-            // 独立物理页上的 `GUEST_STUB_CODE`（xor rax,rax; vmcall; 死循环），作为最小 guest 入口。
-            core::ptr::copy_nonoverlapping(GUEST_STUB_CODE.as_ptr(), guest_stub, GUEST_STUB_CODE.len());
+            // 与 `hv` 一致：`host_stack` 清零。
+            core::ptr::write_bytes(host_stack, 0, 4096);
             vmcs::prepare_msr_auto_lists(msr_auto);
             let tss = host_gdt_tss.add(0x80).cast::<HostTaskState>();
             core::ptr::write_bytes(tss, 0, size_of::<HostTaskState>());
@@ -351,7 +336,6 @@ impl VmxCluster {
                 free_contiguous_page(vmcs);
                 free_contiguous_page(msr_bitmap);
                 free_contiguous_page(host_stack);
-                free_contiguous_page(guest_stub);
                 free_contiguous_page(msr_auto);
                 free_contiguous_page(host_idt);
                 free_contiguous_page(host_gdt_tss);
@@ -366,7 +350,6 @@ impl VmxCluster {
                 free_contiguous_page(vmcs);
                 free_contiguous_page(msr_bitmap);
                 free_contiguous_page(host_stack);
-                free_contiguous_page(guest_stub);
                 free_contiguous_page(msr_auto);
                 free_contiguous_page(host_idt);
                 free_contiguous_page(host_gdt_tss);
@@ -386,7 +369,6 @@ impl VmxCluster {
         cpu.msr_bitmap_page = msr_bitmap;
         cpu.msr_bitmap_phys = msr_bitmap_phys;
         cpu.host_stack_page = host_stack;
-        cpu.guest_stub_page = guest_stub;
         cpu.msr_auto_page = msr_auto;
         cpu.host_idt_page = host_idt;
         cpu.host_gdt_tss_page = host_gdt_tss;
@@ -394,6 +376,17 @@ impl VmxCluster {
 
         if !unsafe { vmx::vmxon(&raw const cpu.vmxon_phys) } {
             logger::log("VMXON failed");
+            unsafe {
+                arch::disable_vmx_hardware();
+                cpu.free_pages();
+            }
+            return wdk_sys::STATUS_UNSUCCESSFUL;
+        }
+
+        // `hv/vcpu.cpp::enter_vmx_operation`：`VMXON` 后 `invept` 全局失效。
+        if !unsafe { vmx::invept_all_contexts() } {
+            logger::log("INVEPT(all-context) after VMXON failed");
+            let _ = unsafe { vmx::vmxoff() };
             unsafe {
                 arch::disable_vmx_hardware();
                 cpu.free_pages();
@@ -422,11 +415,11 @@ impl VmxCluster {
         }
 
         let msr_auto_phys = unsafe { mm::physical_address(msr_auto) };
-        let system_cr3 = introspection::query_process_cr3(4).unwrap_or_else(arch::read_cr3);
+        let system_cr3 = introspection::system_cr3().unwrap_or_else(arch::read_cr3);
         let ctrl_params = vmcs::VmcsControlParams {
             msr_bitmap_pa: Some(cpu.msr_bitmap_phys),
             eptp: cpu.ept.as_ref().map(|v| v.eptp.0),
-            vpid: (index + 1) as u16,
+            vpid: GUEST_VPID,
             cr3_target: Some(system_cr3),
             msr_exit_store_pa: msr_auto_phys,
             msr_entry_load_pa: msr_auto_phys + 64,
@@ -495,40 +488,6 @@ impl VmxCluster {
                 vmcs::VmcsField::GUEST_CS_SELECTOR,
                 err,
             );
-            let _ = unsafe { vmx::vmxoff() };
-            unsafe {
-                arch::disable_vmx_hardware();
-                cpu.free_pages();
-            }
-            return wdk_sys::STATUS_UNSUCCESSFUL;
-        }
-
-        let guest_rip = guest_stub as u64;
-        let guest_rsp = guest_stub as u64 + 0xFF0u64;
-        if let Err(err) = unsafe { vmcs::seed_guest_entry_state(guest_rip, guest_rsp, 0x2) } {
-            logger::log_vmcs_error("seed_guest_entry_state", vmcs::VmcsField::GUEST_RFLAGS, err);
-            let _ = unsafe { vmx::vmxoff() };
-            unsafe {
-                arch::disable_vmx_hardware();
-                cpu.free_pages();
-            }
-            return wdk_sys::STATUS_UNSUCCESSFUL;
-        }
-
-        let guest_rflags = match unsafe { vmcs::vmread(vmcs::VmcsField::GUEST_RFLAGS) } {
-            Ok(v) => v,
-            Err(err) => {
-                logger::log_vmcs_error("vmread", vmcs::VmcsField::GUEST_RFLAGS, err);
-                let _ = unsafe { vmx::vmxoff() };
-                unsafe {
-                    arch::disable_vmx_hardware();
-                    cpu.free_pages();
-                }
-                return wdk_sys::STATUS_UNSUCCESSFUL;
-            }
-        };
-        if guest_rflags != 0x2 {
-            logger::log("VMCS self-check mismatch on GUEST_RFLAGS");
             let _ = unsafe { vmx::vmxoff() };
             unsafe {
                 arch::disable_vmx_hardware();

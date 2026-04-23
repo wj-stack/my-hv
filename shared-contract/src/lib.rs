@@ -64,9 +64,8 @@ pub const ECHO_MAX_LEN: usize = 1024;
 
 pub const PING_RESPONSE_U32: u32 = 0x0047_4E50; // "PNG\0" LE (template marker)
 
-/// Matches MSVC `char32_t` / `uint64_t` multi-character build for `hypervisor_signature` in the old `hv` tree.
-/// (`'fr0g'` in host — same numeric value the guest hypervisor must return in RAX for `PING`.)
-pub const HYPERVISOR_SIGNATURE: u64 = u64::from_le_bytes(*b"fr0g\0\0\0\0");
+/// MSVC `hv::hypervisor_signature = 'fr0g'`：多字符常量按首字符在最高字节（`0x66723067`），与 `hv/um/hv.h` 一致。
+pub const HYPERVISOR_SIGNATURE: u64 = 0x6672_3067;
 
 /// Device & symlink basenames: `\\Device\\{B}` and `\\DosDevices\\{B}` and `\\.\{B}`.
 pub const DEVICE_BASENAME: &str = "MyHvTpl";

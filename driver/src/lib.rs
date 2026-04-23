@@ -56,7 +56,7 @@ mod vmx;
 
 use shared_contract::{
     DEVICE_BASENAME, ECHO_MAX_LEN, HvHypercallIn, HvHypercallOut, IOCTL_ECHO, IOCTL_HV_HYPERCALL,
-    IOCTL_HV_START, IOCTL_HV_STOP, IOCTL_PING, PING_RESPONSE_U32,
+    IOCTL_PING, PING_RESPONSE_U32,
 };
 
 use crate::vcpu::VmxCluster;
