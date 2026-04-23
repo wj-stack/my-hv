@@ -40,10 +40,17 @@ pub unsafe fn wrmsr(msr: u32, value: u64) {
     unsafe { core::arch::asm!("wrmsr", in("ecx") msr, in("eax") lo, in("edx") hi) };
 }
 
+/// 显式 `rax`，避免 `out(reg)` 与 Windows x64 代码生成偶发读错。
+#[inline(never)]
 pub fn read_cr0() -> u64 {
     let v: u64;
-    // SAFETY: no preconditions; reading cr0.
-    unsafe { core::arch::asm!("mov {}, cr0", out(reg) v) };
+    unsafe {
+        core::arch::asm!(
+            "mov rax, cr0",
+            out("rax") v,
+            options(nomem, nostack),
+        );
+    }
     v
 }
 
@@ -56,6 +63,8 @@ pub fn read_cr3() -> u64 {
 }
 
 /// 写 `CR3`（仅在离开 VMX 前从 guest 视图恢复，参考 `handle_vm_exit` 卸载块）。
+/// `#[inline(never)]`：避免内联后与 Windows x64 ABI 交织导致控制寄存器写入用错寄存器。
+#[inline(never)]
 pub unsafe fn write_cr3(v: u64) {
     unsafe {
         core::arch::asm!(
@@ -63,13 +72,19 @@ pub unsafe fn write_cr3(v: u64) {
             in("rax") v,
             options(nostack, nomem),
         );
-    };
+    }
 }
 
+#[inline(never)]
 pub fn read_cr4() -> u64 {
     let v: u64;
-    // SAFETY: no preconditions.
-    unsafe { core::arch::asm!("mov {}, cr4", out(reg) v) };
+    unsafe {
+        core::arch::asm!(
+            "mov rax, cr4",
+            out("rax") v,
+            options(nomem, nostack),
+        );
+    }
     v
 }
 
@@ -96,7 +111,10 @@ pub fn read_fsbase() -> u64 {
     unsafe { rdmsr(ia32::IA32_FS_BASE) }
 }
 
-/// 使用固定 `rax`，避免 Windows x64 上 `in(reg)` 与 `mov cr0, rcx` 类编码在 LLVM 内联汇编里与 ABI 交织出错（曾出现 `rcx==0` 仍执行 `mov cr0` 的蓝屏）。
+/// 写 `CR0`：源操作数固定为 `rax`（勿用 `in(reg)`，曾出现 `mov cr0, rcx` 且 `rcx==0` 的蓝屏）。
+/// 开 VMX 请用 `write_cr0_then_cr4`；本函数保留供其它路径。
+#[allow(dead_code)]
+#[inline(never)]
 pub unsafe fn write_cr0(v: u64) {
     unsafe {
         core::arch::asm!(
@@ -104,25 +122,42 @@ pub unsafe fn write_cr0(v: u64) {
             in("rax") v,
             options(nostack, nomem),
         );
-    };
+    }
 }
 
+/// 写 `CR4`：源操作数固定为 `rdx`。
+#[inline(never)]
 pub unsafe fn write_cr4(v: u64) {
     unsafe {
         core::arch::asm!(
-            "mov cr4, rax",
-            in("rax") v,
+            "mov cr4, rdx",
+            in("rdx") v,
             options(nostack, nomem),
         );
-    };
+    }
 }
 
-const CR4_VMXE: u64 = 1 << 13;
+/// 与 `hv` 中 `__writecr0` 后紧跟 `__writecr4` 一致，且在同一条内联汇编序列中完成，避免 LLVM 在两次独立 `write_cr*` 之间错误分配/破坏寄存器。
+#[inline(never)]
+unsafe fn write_cr0_then_cr4(cr0_val: u64, cr4_val: u64) {
+    unsafe {
+        core::arch::asm!(
+            "mov cr0, rax",
+            "mov cr4, rdx",
+            in("rax") cr0_val,
+            in("rdx") cr4_val,
+            options(nostack, nomem),
+        );
+    }
+}
+
+/// 与 `hv/extern/ia32-doc` 及 `vcpu.cpp` 中 `CR4_VMX_ENABLE_FLAG` 相同（bit 13）。
+const CR4_VMX_ENABLE_FLAG: u64 = 0x2000;
 
 /// 关闭 `CR4.VMXE`（在 `VMXOFF` 之后调用，与 `hv` 中恢复路径一致）。
 pub unsafe fn disable_vmx_hardware() {
     let mut cr4 = read_cr4();
-    cr4 &= !CR4_VMXE;
+    cr4 &= !CR4_VMX_ENABLE_FLAG;
     unsafe { write_cr4(cr4) };
 }
 
@@ -145,49 +180,39 @@ pub fn is_long_mode() -> bool {
     (unsafe { read_msr_efer() } & EFER_LMA) != 0
 }
 
-/// Enable CR4.VMXE after fixing CR0/CR4 against IA32_VMX_{CR0,CR4}_FIXED* (see Intel SDM 3.23.6–8).
+/// 与 `hv/vcpu.cpp::enable_vmx_operation` 同序同语义（Intel SDM 3.23.7–3.23.8）。
 ///
-/// 与 `hv/vcpu.cpp::enable_vmx_operation` 一致：在改写 `CR0`/`CR4` 期间关中断，避免在更新过程中被抢占。
+/// C++：`_disable` → 读 `CR0`/`CR4` → `CR4 |= CR4_VMX_ENABLE_FLAG` → 套用 FIXED MSRs →
+/// `__writecr0` / `__writecr4` → `_enable`。此处 `CR0`/`CR4` 在同一条 asm 中写入（`rax`/`rdx`）。
+///
+/// 开中断：仅当进入前 `RFLAGS.IF` 已置位时再 `sti`。宿主内核/work item 可能在 `IF=0` 的上下文中运行，无条件 `sti` 与 MSVC `_enable()` 行为一致但与 OS 期望不一致，且可能引发异常路径问题。
 pub unsafe fn enable_vmx_in_hardware(cached: &VmxFixedMsrs) -> bool {
     if !has_vmx_in_cpuid() {
-        return false;
-    }
-    if !is_long_mode() {
         return false;
     }
     if !feature_control_allows_vmx() {
         return false;
     }
-    if !cached.fixed_pairs_valid() {
-        return false;
-    }
 
     let rflags = read_rflags();
     let if_was_set = (rflags & (1u64 << 9)) != 0;
+
     unsafe {
         core::arch::asm!("cli", options(nomem, nostack));
     }
 
     let mut cr0 = read_cr0();
     let mut cr4 = read_cr4();
+
+    cr4 |= CR4_VMX_ENABLE_FLAG;
+
     cr0 |= cached.vmx_cr0_fixed0;
     cr0 &= cached.vmx_cr0_fixed1;
-    cr4 |= CR4_VMXE;
     cr4 |= cached.vmx_cr4_fixed0;
     cr4 &= cached.vmx_cr4_fixed1;
 
-    if cr0 == 0 || cr4 == 0 || (cr4 & CR4_VMXE) == 0 {
-        if if_was_set {
-            unsafe {
-                core::arch::asm!("sti", options(nomem, nostack));
-            }
-        }
-        return false;
-    }
-
     unsafe {
-        write_cr0(cr0);
-        write_cr4(cr4);
+        write_cr0_then_cr4(cr0, cr4);
     }
 
     if if_was_set {
@@ -222,36 +247,17 @@ pub fn read_rdtscp() -> (u32, u32, u32) {
 }
 
 impl VmxFixedMsrs {
-    /// Intel SDM：`FIXED0` 中为 1 的位在 `FIXED1` 中必须为 1，否则不存在合法 `CR0`/`CR4`。
-    pub fn fixed_pairs_valid(&self) -> bool {
-        if self.vmx_cr0_fixed1 == 0 || self.vmx_cr4_fixed1 == 0 {
-            return false;
-        }
-        if (self.vmx_cr0_fixed0 & !self.vmx_cr0_fixed1) != 0 {
-            return false;
-        }
-        if (self.vmx_cr4_fixed0 & !self.vmx_cr4_fixed1) != 0 {
-            return false;
-        }
-        let cr4_vmx = (CR4_VMXE | self.vmx_cr4_fixed0) & self.vmx_cr4_fixed1;
-        (cr4_vmx & CR4_VMXE) != 0
-    }
-
-    /// Pull fixed-0/1 values after VMX is available in CPUID. Mirrors `cache_cpu_data` in `hv/hv/vcpu.cpp`.
+    /// 与 `hv/vcpu.cpp::cache_cpu_data` 中 VMX 分支一致：在 `CPUID.1:ECX.VMX` 置位时读四个 `IA32_VMX_CR*_FIXED*`。
     pub fn read() -> Option<Self> {
         if !has_vmx_in_cpuid() {
             return None;
         }
-        // SAFETY: well-known MSRs when VMX present
-        let s = Self {
+        // SAFETY: VMX fixed MSRs per Intel SDM / ia32-doc.
+        Some(Self {
             vmx_cr0_fixed0: unsafe { rdmsr(ia32::IA32_VMX_CR0_FIXED0) },
             vmx_cr0_fixed1: unsafe { rdmsr(ia32::IA32_VMX_CR0_FIXED1) },
             vmx_cr4_fixed0: unsafe { rdmsr(ia32::IA32_VMX_CR4_FIXED0) },
             vmx_cr4_fixed1: unsafe { rdmsr(ia32::IA32_VMX_CR4_FIXED1) },
-        };
-        if !s.fixed_pairs_valid() {
-            return None;
-        }
-        Some(s)
+        })
     }
 }

@@ -5,21 +5,25 @@
 // --- Key MSRs ---
 
 pub const IA32_FEATURE_CONTROL: u32 = 0x0000_00_3A;
-pub const IA32_VMX_BASIC: u32 = 0x0000_00_48;
-pub const IA32_VMX_PINBASED_CTLS: u32 = 0x0000_00_48 + 1;
-pub const IA32_VMX_PROCBASED_CTLS: u32 = 0x0000_00_48 + 2;
-pub const IA32_VMX_EXIT_CTLS: u32 = 0x0000_00_48 + 3;
-pub const IA32_VMX_ENTRY_CTLS: u32 = 0x0000_00_48 + 4;
-pub const IA32_VMX_PROCBASED_CTLS2: u32 = 0x0000_00_48 + 5;
-pub const IA32_VMX_TRUE_PINBASED_CTLS: u32 = 0x0000_00_48 + 6;
-pub const IA32_VMX_TRUE_PROCBASED_CTLS: u32 = 0x0000_00_48 + 7;
-pub const IA32_VMX_TRUE_EXIT_CTLS: u32 = 0x0000_00_48 + 8;
-pub const IA32_VMX_TRUE_ENTRY_CTLS: u32 = 0x0000_00_48 + 9;
-pub const IA32_VMX_CR0_FIXED0: u32 = 0x0000_00_48 + 0x0A;
-pub const IA32_VMX_CR0_FIXED1: u32 = 0x0000_00_48 + 0x0B;
-pub const IA32_VMX_CR4_FIXED0: u32 = 0x0000_00_48 + 0x0C;
-pub const IA32_VMX_CR4_FIXED1: u32 = 0x0000_00_48 + 0x0D;
-pub const IA32_VMX_EPT_VPID_CAP: u32 = 0x0000_00_48 + 0x10;
+// VMX capability MSRs：`IA32_VMX_BASIC` = **0x480**，不是 `0x48`（少写一位会导致整段地址错位）。
+// 与 `hv/extern/ia32-doc/out/ia32.h` 一致。
+pub const IA32_VMX_BASIC: u32 = 0x480;
+pub const IA32_VMX_PINBASED_CTLS: u32 = 0x481;
+pub const IA32_VMX_PROCBASED_CTLS: u32 = 0x482;
+pub const IA32_VMX_EXIT_CTLS: u32 = 0x483;
+pub const IA32_VMX_ENTRY_CTLS: u32 = 0x484;
+pub const IA32_VMX_MISC: u32 = 0x485;
+pub const IA32_VMX_CR0_FIXED0: u32 = 0x486;
+pub const IA32_VMX_CR0_FIXED1: u32 = 0x487;
+pub const IA32_VMX_CR4_FIXED0: u32 = 0x488;
+pub const IA32_VMX_CR4_FIXED1: u32 = 0x489;
+pub const IA32_VMX_VMCS_ENUM: u32 = 0x48A;
+pub const IA32_VMX_PROCBASED_CTLS2: u32 = 0x48B;
+pub const IA32_VMX_EPT_VPID_CAP: u32 = 0x48C;
+pub const IA32_VMX_TRUE_PINBASED_CTLS: u32 = 0x48D;
+pub const IA32_VMX_TRUE_PROCBASED_CTLS: u32 = 0x48E;
+pub const IA32_VMX_TRUE_EXIT_CTLS: u32 = 0x48F;
+pub const IA32_VMX_TRUE_ENTRY_CTLS: u32 = 0x490;
 
 /// VMX basic exit: VMCALL (18)。
 pub const VMX_EXIT_REASON_EXECUTE_VMCALL: u32 = 18;
@@ -201,7 +205,6 @@ pub const VMCS_GUEST_VMX_PREEMPTION_TIMER: u32 = 0x0000_482E;
 pub const VMCS_GUEST_IA32_PERF_GLOBAL_CTRL: u32 = 0x0000_2808;
 pub const VMCS_GUEST_PENDING_DEBUG_EXCEPTIONS: u32 = 0x0000_6822;
 /// IA32 性能/监控相关，供时序/卸载路径对齐 C++ 参考。
-pub const IA32_VMX_MISC: u32 = 0x485;
 pub const IA32_PERF_GLOBAL_CTRL: u32 = 0x38F;
 pub const IA32_TIME_STAMP_COUNTER: u32 = 0x10;
 pub const IA32_MPERF: u32 = 0xE7;
