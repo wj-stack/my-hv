@@ -1,0 +1,64 @@
+;===================================================================
+; my-hv — minimal WDM driver (INF source)
+; 生成后请替换 Provider、硬件 ID、显示名等（见 README.md）。
+;===================================================================
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Sample
+ClassGuid   = {78A1C341-4539-11d3-B88D-00C04FAD5171}
+Provider    = %ProviderString%
+PnpLockDown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskId1%,,,""
+
+[SourceDisksFiles]
+my_hv_driver.sys = 1,,,
+
+; ================= Class section =====================
+
+[ClassInstall32]
+Addreg=SampleClassReg
+
+[SampleClassReg]
+HKR,,,0,%ClassName%
+HKR,,Icon,,-5
+
+; ================= Install section =================
+
+[Manufacturer]
+%StdMfg%=Standard,NT$ARCH$.10.0...16299
+
+[Standard.NT$ARCH$.10.0...16299]
+%DeviceDesc%=MyHvDevice, root\MY_HV_DRIVER
+
+[MyHvDevice.NT$ARCH$]
+CopyFiles=Drivers_Dir
+
+[Drivers_Dir]
+my_hv_driver.sys
+
+; ================= Service installation =================
+[MyHvDevice.NT$ARCH$.Services]
+AddService = MyHvService, %SPSVCINST_ASSOCSERVICE%, MyHv_Service_Install
+
+[MyHv_Service_Install]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\my_hv_driver.sys
+
+; ================= Strings =================
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ProviderString         = "TODO-Set-Provider"
+StdMfg                 = "(Standard system devices)"
+DiskId1                = "my-hv driver installation disk #1"
+DeviceDesc             = "my-hv device"
+ServiceDesc            = "my-hv service"
+ClassName              = "Sample Device"

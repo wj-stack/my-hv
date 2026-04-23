@@ -1,0 +1,34 @@
+[package]
+name = "my-hv-driver"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Minimal WDM driver (my-hv)"
+license = "MIT OR Apache-2.0"
+
+[package.metadata.wdk.driver-model]
+driver-type = "WDM"
+
+[lib]
+crate-type = ["cdylib"]
+
+[build-dependencies]
+wdk-build = "0.5.1"
+
+[dependencies]
+shared-contract = { path = "../shared-contract" }
+wdk = "0.4.1"
+wdk-alloc = "0.4.1"
+wdk-build = "0.5.1"
+wdk-panic = "0.4.1"
+wdk-sys = "0.5.1"
+
+[features]
+default = []
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+lto = true
+panic = "abort"

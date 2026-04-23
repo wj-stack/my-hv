@@ -1,0 +1,26 @@
+# cargo-generate 展开后：工作区根为生成项目名（见各成员 Cargo.toml）。
+[workspace]
+
+members = ["driver", "client", "shared-contract"]
+
+resolver = "3"
+
+
+
+# 工作区根 [profile] 对所有成员生效。no_std 内核驱动要求 panic=abort。
+
+# 注意：Cargo 不允许在 `[profile.*.package.*]` 里写 `panic`，故在此统一设置。
+
+[profile.dev]
+
+panic = "abort"
+
+
+
+[profile.release]
+
+lto = true
+
+panic = "abort"
+
+

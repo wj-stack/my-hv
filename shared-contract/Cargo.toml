@@ -1,0 +1,8 @@
+[package]
+name = "shared-contract"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Shared IOCTL constants and limits for my-hv (no_std; kernel + user mode)"
+
+[dependencies]

@@ -1,0 +1,27 @@
+---
+description: 编译与测试必须通过 build.bat 加载环境，禁止裸跑 cargo
+alwaysApply: true
+---
+
+# 构建与测试：使用 `build.bat`
+
+本项目的 Windows 驱动 / WDK 相关构建依赖 **已加载的环境**（例如 eWDK、VS 工具链、PATH 等）。**不得在终端中直接执行** `cargo build`、`cargo test`、`cargo clippy`、`cargo make`（以及任何会触发同类链接/绑定的 Cargo 子命令），否则会出现链接或 bindgen 等错误。
+
+## 正确做法
+
+- 在**项目根目录**（存在 `build.bat` 的目录）通过 **`build.bat`** 发起编译与测试；由脚本先设置环境，再调用 Cargo 或封装命令。
+- 需要代理/包装某条 Cargo 命令时，应修改或扩展 `build.bat`，而不是在 Cursor 终端里绕过脚本裸跑。
+
+## 反例与正例
+
+```text
+❌ 错误（易失败）
+cargo build -p xxx-driver
+cargo test
+cargo make
+
+✅ 正确
+.\build.bat
+```
+
+在回答中若涉及“如何构建/如何跑测试”，**默认说明使用 `build.bat`**；若用户尚未添加该脚本，应提示先提供与 eWDK 一致的入口脚本，再执行构建类命令。

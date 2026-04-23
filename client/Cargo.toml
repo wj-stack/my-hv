@@ -1,0 +1,21 @@
+[package]
+name = "my-hv-client"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "User-mode client for my-hv-driver (ping/echo IOCTLs)"
+
+[[bin]]
+name = "my-hv-client"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+shared-contract = { path = "../shared-contract" }
+windows = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
