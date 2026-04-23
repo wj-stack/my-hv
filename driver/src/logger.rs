@@ -1,13 +1,17 @@
 //! 诊断日志。对应 `hv/hv/logger.*`；当前使用 `wdk::println!`。
 
 use wdk::println;
-use crate::vmcs::{VmcsAccessError, VmcsField};
+use crate::vmcs::VmcsAccessError;
 
 pub fn log(msg: &str) {
     println!("[my-hv-driver] {msg}");
 }
 
-pub fn log_vmcs_error(op: &str, field: VmcsField, err: VmcsAccessError) {
+pub fn log_vmcs_error(op: &str, err: VmcsAccessError) {
+    let field = match err {
+        VmcsAccessError::VmFailInvalid { field } => field,
+        VmcsAccessError::VmFailValid { field, .. } => field,
+    };
     println!(
         "[my-hv-driver] VMCS {op} failed: field=0x{:x}, err={:?}",
         field.raw(),
@@ -15,6 +19,7 @@ pub fn log_vmcs_error(op: &str, field: VmcsField, err: VmcsAccessError) {
     );
 }
 
+#[allow(dead_code)] // bring-up 可选；`init_cpu` 在嵌套 VMX 下不调用 guest VMREAD 快照。
 pub fn log_vmcs_guest_state(rip: u64, rsp: u64, rflags: u64) {
     println!(
         "[my-hv-driver] VMCS guest state seeded: rip=0x{:x}, rsp=0x{:x}, rflags=0x{:x}",

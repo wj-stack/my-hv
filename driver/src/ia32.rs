@@ -282,9 +282,10 @@ pub const fn vmx_true_controls_msr_or_default(basic: u64, true_msr: u32, legacy_
     }
 }
 
+/// 与 `hv/hv/vmx.inl::impl::write_vmcs_ctrl_field` 一致：`value &= cap >> 32; value |= cap & 0xFFFFFFFF`。
 #[inline]
 pub const fn adjust_vmx_control(requested: u32, msr_value: u64) -> u32 {
-    let allowed0 = msr_value as u32;
-    let allowed1 = (msr_value >> 32) as u32;
-    (requested | allowed0) & allowed1
+    let low = msr_value as u32;
+    let high = (msr_value >> 32) as u32;
+    (requested & high) | low
 }

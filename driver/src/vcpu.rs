@@ -465,7 +465,7 @@ impl VmxCluster {
             msr_entry_load_pa: msr_auto_phys + 64,
         };
         if let Err(err) = unsafe { vmcs::configure_control_fields(&ctrl_params) } {
-            logger::log_vmcs_error("configure_control_fields", vmcs::VmcsField::CTRL_CPU_BASED, err);
+            logger::log_vmcs_error("configure_control_fields", err);
             let _ = unsafe { vmx::vmxoff() };
             unsafe {
                 arch::disable_vmx_hardware();
@@ -502,7 +502,7 @@ impl VmxCluster {
             fs_base: cpu_self_va,
         };
         if let Err(err) = unsafe { vmcs::configure_host_state(&host_layout) } {
-            logger::log_vmcs_error("configure_host_state", vmcs::VmcsField::HOST_RIP, err);
+            logger::log_vmcs_error("configure_host_state", err);
             let _ = unsafe { vmx::vmxoff() };
             unsafe {
                 arch::disable_vmx_hardware();
@@ -512,7 +512,7 @@ impl VmxCluster {
         }
 
         if let Err(err) = unsafe { vmcs::configure_guest_state() } {
-            logger::log_vmcs_error("configure_guest_state", vmcs::VmcsField::GUEST_CR3, err);
+            logger::log_vmcs_error("configure_guest_state", err);
             let _ = unsafe { vmx::vmxoff() };
             unsafe {
                 arch::disable_vmx_hardware();
@@ -522,11 +522,7 @@ impl VmxCluster {
         }
 
         if let Err(err) = unsafe { vmcs::configure_guest_segment_state() } {
-            logger::log_vmcs_error(
-                "configure_guest_segment_state",
-                vmcs::VmcsField::GUEST_CS_SELECTOR,
-                err,
-            );
+            logger::log_vmcs_error("configure_guest_segment_state", err);
             let _ = unsafe { vmx::vmxoff() };
             unsafe {
                 arch::disable_vmx_hardware();
@@ -535,14 +531,9 @@ impl VmxCluster {
             return wdk_sys::STATUS_UNSUCCESSFUL;
         }
 
-        match unsafe { vmcs::read_guest_state_snapshot() } {
-            Ok(snapshot) => {
-                logger::log_vmcs_guest_state(snapshot.rip, snapshot.rsp, snapshot.rflags);
-            }
-            Err(err) => {
-                logger::log_vmcs_error("vmread(guest_state_snapshot)", vmcs::VmcsField::GUEST_RIP, err);
-            }
-        }
+        // 不在此做 `read_guest_state_snapshot`：嵌套/受限 VMX 下对 `GUEST_RIP`(0x681E) 等 guest 字段的
+        // VMREAD 常被拒绝，且仅用于 bring-up 日志，非 VMLAUNCH 所必需。需要时可手动调用
+        // `vmcs::read_guest_state_snapshot`（例如裸机调试）。
 
         if !unsafe { vm_launch::vmlaunch_enter_guest() } {
             let inst_err = unsafe { vmcs::vmread(vmcs::VmcsField::VM_INSTRUCTION_ERROR) };
@@ -554,7 +545,7 @@ impl VmxCluster {
                     );
                 }
                 Err(e) => {
-                    logger::log_vmcs_error("vmread(VM_INSTRUCTION_ERROR)", vmcs::VmcsField::VM_INSTRUCTION_ERROR, e);
+                    logger::log_vmcs_error("vmread(VM_INSTRUCTION_ERROR)", e);
                 }
             }
             let _ = unsafe { vmx::vmxoff() };

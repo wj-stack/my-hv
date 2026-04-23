@@ -175,7 +175,8 @@ pub enum VmcsAccessError {
     },
 }
 
-/// VMCS 中的基本 guest 状态快照（用于 bring-up 期诊断）。
+/// VMCS 中的基本 guest 状态快照（用于 bring-up 期诊断；嵌套 VMX 下 guest VMREAD 可能不可用）。
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GuestStateSnapshot {
     pub rip: u64,
@@ -217,12 +218,15 @@ fn decode_vmx_status(rflags: u64) -> VmxInstructionStatus {
     }
 }
 
-#[inline]
+/// 勿 `#[inline]`：内联后 LLVM 对 `lateout`/RFLAGS 的寄存器分配曾与 Win64 下 VMX 指令交织出问题。
+#[inline(never)]
 unsafe fn vmwrite_raw(field: VmcsField, value: u64) -> VmxInstructionStatus {
     let rflags: u64;
     unsafe {
+        // Intel：`VMWRITE` 的源操作数为待写入值，目的（字段编码）为第二操作数。LLVM AT&T 下需写成
+        // `vmwrite {field}, {value}`，才能在 Win64 ABI（RCX/RDX）下得到 `vmwriteq %rdx, %rcx`。
         core::arch::asm!(
-            "vmwrite {value}, {field}",
+            "vmwrite {field}, {value}",
             "pushfq",
             "pop {rflags}",
             value = in(reg) value,
@@ -233,13 +237,14 @@ unsafe fn vmwrite_raw(field: VmcsField, value: u64) -> VmxInstructionStatus {
     decode_vmx_status(rflags)
 }
 
-#[inline]
+#[inline(never)]
 unsafe fn vmread_raw(field: VmcsField) -> (VmxInstructionStatus, u64) {
     let value: u64;
     let rflags: u64;
     unsafe {
+        // 与 `VMWRITE` 同理：`VMREAD` 第一操作数为读出的值，第二为字段编码。
         core::arch::asm!(
-            "vmread {value}, {field}",
+            "vmread {field}, {value}",
             "pushfq",
             "pop {rflags}",
             value = lateout(reg) value,
@@ -456,9 +461,9 @@ pub unsafe fn configure_control_fields(params: &VmcsControlParams) -> Result<(),
         ia32::IA32_VMX_ENTRY_CTLS,
     );
 
-    let pin_req = ia32::PIN_BASED_NMI_EXITING
-        | ia32::PIN_BASED_VIRTUAL_NMI
-        | ia32::PIN_BASED_ACTIVATE_VMX_PREEMPTION_TIMER;
+    // 与 `hv` 不同：不请求 `ACTIVATE_VMX_PREEMPTION_TIMER`。嵌套/受限 VMX 下对 0x482E 的 VMWRITE
+    // 常失败；裸机若要抢占定时器可在此重新 OR 上 `PIN_BASED_ACTIVATE_VMX_PREEMPTION_TIMER` 并写初值。
+    let pin_req = ia32::PIN_BASED_NMI_EXITING | ia32::PIN_BASED_VIRTUAL_NMI;
     let pin = ia32::adjust_vmx_control(pin_req, unsafe { arch::rdmsr(pin_msr) });
 
     // 与 `hv/vmcs.cpp` 一致：primary 仅 CR3-load exiting + MSR 位图 + TSC offset + secondary。
@@ -486,14 +491,14 @@ pub unsafe fn configure_control_fields(params: &VmcsControlParams) -> Result<(),
         unsafe { arch::rdmsr(entry_msr) },
     );
 
-    let mut secondary_req = ia32::SECONDARY_CONTROL_ENABLE_RDTSCP
+    // 与 `hv/hv/vmcs.cpp::write_vmcs_ctrl_fields` 一致：始终请求 EPT + VPID（由能力 MSR 裁剪）。
+    let secondary_req = ia32::SECONDARY_CONTROL_ENABLE_EPT
+        | ia32::SECONDARY_CONTROL_ENABLE_VPID
+        | ia32::SECONDARY_CONTROL_ENABLE_RDTSCP
         | ia32::SECONDARY_CONTROL_ENABLE_INVPCID
         | ia32::SECONDARY_CONTROL_ENABLE_XSAVES_XRSTORS
         | ia32::SECONDARY_CONTROL_ENABLE_USER_WAIT_PAUSE
         | ia32::SECONDARY_CONTROL_CONCEAL_VMX_FROM_PT;
-    if params.eptp.is_some() {
-        secondary_req |= ia32::SECONDARY_CONTROL_ENABLE_EPT | ia32::SECONDARY_CONTROL_ENABLE_VPID;
-    }
     let secondary = ia32::adjust_vmx_control(
         secondary_req,
         unsafe { arch::rdmsr(ia32::IA32_VMX_PROCBASED_CTLS2) },
@@ -669,6 +674,8 @@ pub unsafe fn configure_host_state(layout: &HostVmcsLayout) -> Result<(), VmcsAc
 
 /// 写入最小 guest 字段。
 ///
+/// 未写 `GUEST_VMX_PREEMPTION_TIMER`：pin 未启用抢占定时器时无需；嵌套环境下对该字段 VMWRITE 易失败。
+///
 /// `GUEST_RIP`/`GUEST_RSP` 先置 0，由 `hv_vm_launch` 在 `VMLAUNCH` 前写入（与 `hv/vmcs.cpp` + `vm-launch.asm` 一致）。
 ///
 /// # Safety
@@ -686,11 +693,15 @@ pub unsafe fn configure_guest_state() -> Result<(), VmcsAccessError> {
             VmcsField::GUEST_IA32_PERF_GLOBAL_CTRL,
             arch::rdmsr(ia32::IA32_PERF_GLOBAL_CTRL),
         )?;
-        vmwrite(VmcsField::GUEST_VMCS_LINK_POINTER, ia32::MAXULONG64)?;
+        // 以下顺序与 `hv/hv/vmcs.cpp::write_vmcs_guest_fields` 一致（`vmx_active` = 0）。
         vmwrite(VmcsField::GUEST_ACTIVITY_STATE, 0)?;
         vmwrite(VmcsField::GUEST_INTERRUPTIBILITY_STATE, 0)?;
         vmwrite(VmcsField::GUEST_PENDING_DEBUG_EXCEPTIONS, 0)?;
-        vmwrite(VmcsField::GUEST_VMX_PREEMPTION_TIMER, ia32::MAXULONG64)?;
+        vmwrite(VmcsField::GUEST_VMCS_LINK_POINTER, ia32::MAXULONG64)?;
+
+        // TODO: 未写 `GUEST_VMX_PREEMPTION_TIMER`：pin 未启用抢占定时器时无需；嵌套环境下对该字段 VMWRITE 易失败。
+        // TODO: 写入它可能需要更多的条件
+        // vmwrite(VmcsField::GUEST_VMX_PREEMPTION_TIMER, 0)?;
     }
     Ok(())
 }
@@ -699,6 +710,7 @@ pub unsafe fn configure_guest_state() -> Result<(), VmcsAccessError> {
 ///
 /// # Safety
 /// 调用前必须已 `VMPTRLD` 当前 VMCS，且运行在 VMX root。
+#[allow(dead_code)]
 pub unsafe fn read_guest_state_snapshot() -> Result<GuestStateSnapshot, VmcsAccessError> {
     let rip = unsafe { vmread(VmcsField::GUEST_RIP)? };
     let rsp = unsafe { vmread(VmcsField::GUEST_RSP)? };
