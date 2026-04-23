@@ -9,11 +9,17 @@ use wdk_sys::ntddk::{
 use wdk_sys::{NTSTATUS, POOL_FLAG_NON_PAGED, SIZE_T, ULONG};
 
 use crate::arch::{self, VmxFixedMsrs};
+use crate::ept::EptState;
+use crate::exit_handlers;
+use crate::logger;
 use crate::mm::{self, free_contiguous_page};
 use crate::vmcs;
 use crate::vmx;
 
 const POOL_TAG: ULONG = u32::from_ne_bytes(*b"HvVc");
+const ENABLE_EXPERIMENTAL_VMENTRY: bool = false;
+
+extern "C" fn vmexit_host_stub() {}
 
 /// 单 CPU 上的 VMX root 资源。
 pub struct PerCpuState {
@@ -21,6 +27,9 @@ pub struct PerCpuState {
     pub vmcs_page: *mut u8,
     pub vmxon_phys: u64,
     pub vmcs_phys: u64,
+    pub msr_bitmap_page: *mut u8,
+    pub msr_bitmap_phys: u64,
+    pub ept: Option<EptState>,
     /// 已成功执行 `VMXON`。
     pub vmxon_done: bool,
 }
@@ -32,6 +41,9 @@ impl PerCpuState {
             vmcs_page: core::ptr::null_mut(),
             vmxon_phys: 0,
             vmcs_phys: 0,
+            msr_bitmap_page: core::ptr::null_mut(),
+            msr_bitmap_phys: 0,
+            ept: None,
             vmxon_done: false,
         }
     }
@@ -40,9 +52,15 @@ impl PerCpuState {
         unsafe {
             free_contiguous_page(self.vmxon_page);
             free_contiguous_page(self.vmcs_page);
+            free_contiguous_page(self.msr_bitmap_page);
+        }
+        if let Some(mut ept) = self.ept.take() {
+            unsafe { ept.release() };
         }
         self.vmxon_page = core::ptr::null_mut();
         self.vmcs_page = core::ptr::null_mut();
+        self.msr_bitmap_page = core::ptr::null_mut();
+        self.msr_bitmap_phys = 0;
         self.vmxon_done = false;
     }
 }
@@ -66,11 +84,13 @@ impl VmxCluster {
     /// 调用方必须处于 `IRQL <= APC_LEVEL`（与 `KeSetSystemAffinityThreadEx` 要求一致）。
     pub unsafe fn start() -> Result<Self, NTSTATUS> {
         if !vmx::host_supports_vmx_root() {
+            logger::log("VMX root not supported by platform");
             return Err(wdk_sys::STATUS_NOT_SUPPORTED);
         }
 
         let count = unsafe { KeQueryActiveProcessorCountEx(0) };
         if count == 0 {
+            logger::log("no active processors in group 0");
             return Err(wdk_sys::STATUS_UNSUCCESSFUL);
         }
 
@@ -83,6 +103,7 @@ impl VmxCluster {
             )
         } as *mut PerCpuState;
         if cpus.is_null() {
+            logger::log("failed to allocate per-cpu VMX state array");
             return Err(wdk_sys::STATUS_INSUFFICIENT_RESOURCES);
         }
         unsafe {
@@ -101,6 +122,7 @@ impl VmxCluster {
             let st = unsafe { cluster.init_cpu(i) };
             unsafe { KeRevertToUserAffinityThreadEx(prev) };
             if !wdk::nt_success(st) {
+                logger::log("VMX init failed on a CPU, starting rollback");
                 unsafe { cluster.rollback_partial(i) };
                 unsafe { ExFreePoolWithTag(cpus.cast(), POOL_TAG) };
                 return Err(st);
@@ -116,43 +138,64 @@ impl VmxCluster {
         *cpu = PerCpuState::empty();
 
         let Some(vmxon) = (unsafe { mm::alloc_contiguous_page() }) else {
+            logger::log("failed to allocate VMXON page");
             return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
         };
         let Some(vmcs) = (unsafe { mm::alloc_contiguous_page() }) else {
+            logger::log("failed to allocate VMCS page");
             unsafe { free_contiguous_page(vmxon) };
+            return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
+        };
+        let Some(msr_bitmap) = (unsafe { mm::alloc_contiguous_page() }) else {
+            logger::log("failed to allocate MSR bitmap page");
+            unsafe {
+                free_contiguous_page(vmxon);
+                free_contiguous_page(vmcs);
+            }
             return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
         };
 
         unsafe {
             vmcs::prepare_vmxon_region(vmxon);
             vmcs::prepare_vmcs_region(vmcs);
+            core::ptr::write_bytes(msr_bitmap, 0xFF, 4096);
         }
 
         let Some(fixed) = VmxFixedMsrs::read() else {
+            logger::log("failed to read VMX fixed MSRs");
             unsafe {
                 free_contiguous_page(vmxon);
                 free_contiguous_page(vmcs);
+                free_contiguous_page(msr_bitmap);
             }
             return wdk_sys::STATUS_NOT_SUPPORTED;
         };
 
         if !unsafe { arch::enable_vmx_in_hardware(&fixed) } {
+            logger::log("enable_vmx_in_hardware returned false");
             unsafe {
                 free_contiguous_page(vmxon);
                 free_contiguous_page(vmcs);
+                free_contiguous_page(msr_bitmap);
             }
             return wdk_sys::STATUS_NOT_SUPPORTED;
         }
 
         let vmxon_phys = unsafe { mm::physical_address(vmxon) };
         let vmcs_phys = unsafe { mm::physical_address(vmcs) };
+        let msr_bitmap_phys = unsafe { mm::physical_address(msr_bitmap) };
+        let ept = unsafe { EptState::build_identity_skeleton() };
 
         cpu.vmxon_page = vmxon;
         cpu.vmcs_page = vmcs;
         cpu.vmxon_phys = vmxon_phys;
         cpu.vmcs_phys = vmcs_phys;
+        cpu.msr_bitmap_page = msr_bitmap;
+        cpu.msr_bitmap_phys = msr_bitmap_phys;
+        cpu.ept = ept;
 
         if !unsafe { vmx::vmxon(&raw const cpu.vmxon_phys) } {
+            logger::log("VMXON failed");
             unsafe {
                 arch::disable_vmx_hardware();
                 cpu.free_pages();
@@ -161,6 +204,7 @@ impl VmxCluster {
         }
 
         if !unsafe { vmx::vmclear(&raw const cpu.vmcs_phys) } {
+            logger::log("VMCLEAR failed");
             let _ = unsafe { vmx::vmxoff() };
             unsafe {
                 arch::disable_vmx_hardware();
@@ -170,12 +214,131 @@ impl VmxCluster {
         }
 
         if !unsafe { vmx::vmptrld(&raw const cpu.vmcs_phys) } {
+            logger::log("VMPTRLD failed");
             let _ = unsafe { vmx::vmxoff() };
             unsafe {
                 arch::disable_vmx_hardware();
                 cpu.free_pages();
             }
             return wdk_sys::STATUS_UNSUCCESSFUL;
+        }
+
+        if let Err(err) = unsafe {
+            vmcs::configure_control_fields(
+                Some(cpu.msr_bitmap_phys),
+                cpu.ept.as_ref().map(|v| v.eptp.0),
+            )
+        } {
+            logger::log_vmcs_error("configure_control_fields", vmcs::VmcsField::CTRL_CPU_BASED, err);
+            let _ = unsafe { vmx::vmxoff() };
+            unsafe {
+                arch::disable_vmx_hardware();
+                cpu.free_pages();
+            }
+            return wdk_sys::STATUS_UNSUCCESSFUL;
+        }
+
+        if let Some(ref ept) = cpu.ept {
+            if !unsafe { ept.invept_single_context() } {
+                logger::log("INVEPT(single-context) failed");
+                let _ = unsafe { vmx::vmxoff() };
+                unsafe {
+                    arch::disable_vmx_hardware();
+                    cpu.free_pages();
+                }
+                return wdk_sys::STATUS_UNSUCCESSFUL;
+            }
+        }
+
+        let host_rsp = cpu.vmcs_page as u64 + 4096 - 0x20;
+        if let Err(err) = unsafe {
+            vmcs::configure_host_state(vmexit_host_stub as *const () as usize as u64, host_rsp)
+        } {
+            logger::log_vmcs_error("configure_host_state", vmcs::VmcsField::HOST_RIP, err);
+            let _ = unsafe { vmx::vmxoff() };
+            unsafe {
+                arch::disable_vmx_hardware();
+                cpu.free_pages();
+            }
+            return wdk_sys::STATUS_UNSUCCESSFUL;
+        }
+
+        if let Err(err) = unsafe { vmcs::configure_guest_state() } {
+            logger::log_vmcs_error("configure_guest_state", vmcs::VmcsField::GUEST_CR3, err);
+            let _ = unsafe { vmx::vmxoff() };
+            unsafe {
+                arch::disable_vmx_hardware();
+                cpu.free_pages();
+            }
+            return wdk_sys::STATUS_UNSUCCESSFUL;
+        }
+
+        if let Err(err) = unsafe { vmcs::seed_minimal_guest_state() } {
+            logger::log_vmcs_error("seed_minimal_guest_state", vmcs::VmcsField::GUEST_RFLAGS, err);
+            let _ = unsafe { vmx::vmxoff() };
+            unsafe {
+                arch::disable_vmx_hardware();
+                cpu.free_pages();
+            }
+            return wdk_sys::STATUS_UNSUCCESSFUL;
+        }
+
+        let guest_rflags = match unsafe { vmcs::vmread(vmcs::VmcsField::GUEST_RFLAGS) } {
+            Ok(v) => v,
+            Err(err) => {
+                logger::log_vmcs_error("vmread", vmcs::VmcsField::GUEST_RFLAGS, err);
+                let _ = unsafe { vmx::vmxoff() };
+                unsafe {
+                    arch::disable_vmx_hardware();
+                    cpu.free_pages();
+                }
+                return wdk_sys::STATUS_UNSUCCESSFUL;
+            }
+        };
+        if guest_rflags != 0x2 {
+            logger::log("VMCS self-check mismatch on GUEST_RFLAGS");
+            let _ = unsafe { vmx::vmxoff() };
+            unsafe {
+                arch::disable_vmx_hardware();
+                cpu.free_pages();
+            }
+            return wdk_sys::STATUS_UNSUCCESSFUL;
+        }
+
+        match unsafe { vmcs::read_guest_state_snapshot() } {
+            Ok(snapshot) => {
+                logger::log_vmcs_guest_state(snapshot.rip, snapshot.rsp, snapshot.rflags);
+            }
+            Err(err) => {
+                logger::log_vmcs_error("vmread(guest_state_snapshot)", vmcs::VmcsField::GUEST_RIP, err);
+            }
+        }
+
+        match unsafe { vmcs::read_exit_reason() } {
+            Ok(reason) => {
+                logger::log_vm_exit_reason(reason.basic, reason.raw);
+                exit_handlers::log_basic_exit(reason.basic as u32);
+                let ctx = exit_handlers::VmExitContext {
+                    reason,
+                    guest_rip: 0,
+                    guest_rsp: 0,
+                    guest_rflags: guest_rflags,
+                };
+                let mut no_cluster = None;
+                let _ = exit_handlers::dispatch_vm_exit(&mut no_cluster, &ctx, 0, [0; 6]);
+            }
+            Err(err) => {
+                logger::log_vmcs_error("vmread(EXIT_REASON)", vmcs::VmcsField::EXIT_REASON, err);
+            }
+        }
+
+        if ENABLE_EXPERIMENTAL_VMENTRY {
+            let launched = unsafe { vmx::vmlaunch() };
+            if !launched {
+                logger::log("vmlaunch returned failure");
+            } else {
+                let _ = unsafe { vmx::vmresume() };
+            }
         }
 
         cpu.vmxon_done = true;

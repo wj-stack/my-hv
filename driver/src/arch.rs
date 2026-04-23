@@ -14,29 +14,30 @@ pub fn has_vmx_in_cpuid() -> bool {
 /// CPUID. Returns EAX, EBX, ECX, EDX for a given leaf; `sub` is the ECX sub-leaf.
 pub fn cpuid(leaf: u32, sub: u32) -> CpuidResult {
     if sub == 0 {
-        // SAFETY: fixed leaf read.
-        unsafe { __cpuid(leaf) }
+        __cpuid(leaf)
     } else {
-        // SAFETY: CPUID with sub-leaf.
-        unsafe { __cpuid_count(leaf, sub) }
+        __cpuid_count(leaf, sub)
     }
 }
 
 pub unsafe fn rdmsr(msr: u32) -> u64 {
     let (hi, lo): (u32, u32);
-    core::arch::asm!(
-        "rdmsr",
-        in("ecx") msr,
-        out("eax") lo,
-        out("edx") hi,
-    );
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") lo,
+            out("edx") hi,
+        );
+    }
     ((hi as u64) << 32) | (lo as u64)
 }
 
+#[allow(dead_code)]
 pub unsafe fn wrmsr(msr: u32, value: u64) {
     let lo = value as u32;
     let hi = (value >> 32) as u32;
-    core::arch::asm!("wrmsr", in("ecx") msr, in("eax") lo, in("edx") hi);
+    unsafe { core::arch::asm!("wrmsr", in("ecx") msr, in("eax") lo, in("edx") hi) };
 }
 
 pub fn read_cr0() -> u64 {
@@ -46,6 +47,7 @@ pub fn read_cr0() -> u64 {
     v
 }
 
+#[allow(dead_code)]
 pub fn read_cr3() -> u64 {
     let v: u64;
     // SAFETY: no preconditions.
@@ -61,11 +63,11 @@ pub fn read_cr4() -> u64 {
 }
 
 pub unsafe fn write_cr0(v: u64) {
-    core::arch::asm!("mov cr0, {}", in(reg) v);
+    unsafe { core::arch::asm!("mov cr0, {}", in(reg) v) };
 }
 
 pub unsafe fn write_cr4(v: u64) {
-    core::arch::asm!("mov cr4, {}", in(reg) v);
+    unsafe { core::arch::asm!("mov cr4, {}", in(reg) v) };
 }
 
 const CR4_VMXE: u64 = 1 << 13;
@@ -80,7 +82,7 @@ pub unsafe fn disable_vmx_hardware() {
 const EFER_LMA: u64 = 1 << 10;
 
 pub unsafe fn read_msr_efer() -> u64 {
-    rdmsr(0xC000_0080)
+    unsafe { rdmsr(0xC000_0080) }
 }
 
 /// IA32_FEATURE_CONTROL: lock and VMX outside SMX must be set in firmware for our bring-up.
@@ -115,8 +117,10 @@ pub unsafe fn enable_vmx_in_hardware(cached: &VmxFixedMsrs) -> bool {
     cr4 |= CR4_VMXE;
     cr4 |= cached.vmx_cr4_fixed0;
     cr4 &= cached.vmx_cr4_fixed1;
-    write_cr0(cr0);
-    write_cr4(cr4);
+    unsafe {
+        write_cr0(cr0);
+        write_cr4(cr4);
+    }
     true
 }
 

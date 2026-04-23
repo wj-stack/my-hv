@@ -166,7 +166,7 @@ unsafe extern "C" fn dispatch_device_control(
                     if session.is_some() {
                         return STATUS_ALREADY_INITIALIZED;
                     }
-                    match unsafe { VmxCluster::start() } {
+                    match VmxCluster::start() {
                         Ok(c) => {
                             *session = Some(c);
                             STATUS_SUCCESS
@@ -181,7 +181,7 @@ unsafe extern "C" fn dispatch_device_control(
             let status = unsafe {
                 with_session(|session| {
                     if let Some(mut c) = session.take() {
-                        unsafe { c.stop() };
+                        c.stop();
                     }
                     STATUS_SUCCESS
                 })
