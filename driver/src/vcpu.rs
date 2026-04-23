@@ -11,15 +11,16 @@ use wdk_sys::{NTSTATUS, POOL_FLAG_NON_PAGED, SIZE_T, ULONG};
 
 use crate::arch::{self, VmxFixedMsrs};
 use crate::ept::EptState;
-use crate::exit_handlers;
-use crate::guest_context::GuestRegs;
 use crate::ia32;
 use crate::logger;
 use crate::msr_bitmap;
+use crate::introspection;
 use crate::mm::{self, free_contiguous_page};
 use crate::vmcs;
 use crate::vmexit;
+use crate::vm_launch;
 use crate::vmx;
+use shared_contract::{HypercallCode, HYPERCALL_KEY, HYPERVISOR_SIGNATURE};
 
 const POOL_TAG: ULONG = u32::from_ne_bytes(*b"HvVc");
 
@@ -84,6 +85,8 @@ pub struct PerCpuState {
     pub msr_bitmap_phys: u64,
     pub host_stack_page: *mut u8,
     pub guest_stub_page: *mut u8,
+    /// MSR 自动存/装列表（`hv` 的 `msr_exit_store` + `msr_entry_load`），单页。
+    pub msr_auto_page: *mut u8,
     pub ept: Option<EptState>,
     /// 与参考 `cache_cpu_data` 对齐的只读/伪造 MSR 缓存。
     pub cache: VcpuCache,
@@ -102,6 +105,7 @@ impl PerCpuState {
             msr_bitmap_phys: 0,
             host_stack_page: core::ptr::null_mut(),
             guest_stub_page: core::ptr::null_mut(),
+            msr_auto_page: core::ptr::null_mut(),
             ept: None,
             cache: VcpuCache::empty(),
             vmxon_done: false,
@@ -115,6 +119,7 @@ impl PerCpuState {
             free_contiguous_page(self.msr_bitmap_page);
             free_contiguous_page(self.host_stack_page);
             free_contiguous_page(self.guest_stub_page);
+            free_contiguous_page(self.msr_auto_page);
         }
         if let Some(mut ept) = self.ept.take() {
             unsafe { ept.release() };
@@ -124,6 +129,7 @@ impl PerCpuState {
         self.msr_bitmap_page = core::ptr::null_mut();
         self.host_stack_page = core::ptr::null_mut();
         self.guest_stub_page = core::ptr::null_mut();
+        self.msr_auto_page = core::ptr::null_mut();
         self.msr_bitmap_phys = 0;
         self.vmxon_done = false;
     }
@@ -248,13 +254,36 @@ impl VmxCluster {
             }
             return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
         };
+        let Some(msr_auto) = (unsafe { mm::alloc_contiguous_page() }) else {
+            logger::log("failed to allocate MSR auto-load/store page");
+            unsafe {
+                free_contiguous_page(vmxon);
+                free_contiguous_page(vmcs);
+                free_contiguous_page(msr_bitmap);
+                free_contiguous_page(host_stack);
+                free_contiguous_page(guest_stub);
+            }
+            return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
+        };
 
+        // 在 `VMXON` / `VMCLEAR` 之前初始化各 4KiB 控制结构。对照 `hv/hv/vcpu.cpp` 的 `virtualize_cpu`：
+        // - `prepare_vmxon_region` ≈ `enter_vmx_operation()` 里对 `vmxon_region.revision_id` / `must_be_zero` 的填写；
+        // - `prepare_vmcs_region` ≈ `load_vmcs_pointer()` 里对 `vmcs_region.revision_id` / `shadow_vmcs_indicator` 的填写；
+        // - `prepare_msr_bitmap_page` ≈ `prepare_external_structures()` 里 `memset(msr_bitmap)` + FEATURE_CONTROL 读退出 + `enable_mtrr_exiting`。
         unsafe {
+            // 写入 IA32_VMX_BASIC 中的 VMCS revision id，满足 Intel SDM 对 VMXON 区域的要求。
             vmcs::prepare_vmxon_region(vmxon);
+            // 同上，供后续 VMCLEAR/VMPTRLD 使用的 VMCS 区域头。
             vmcs::prepare_vmcs_region(vmcs);
+            // 整页 MSR 位图：默认不拦截；对 FEATURE_CONTROL 读与 MTRR 相关写置位以在 guest 访问时 VM-exit。
             msr_bitmap::prepare_msr_bitmap_page(msr_bitmap);
+            // Host VM-exit 处理栈。参考工程在 `virtualize_cpu` 开头 `memset(cpu,0,...)` 把 `host_stack` 清零；
+            // 这里用 0xCC（INT3）填满一页，便于栈下溢或未初始化使用时立刻断在调试器里。
             core::ptr::write_bytes(host_stack, 0xCC, 4096);
+            // 参考 HV 的 guest 初始 RIP 来自 `write_vmcs_guest_fields()`（当前内核上下文）；本驱动改为映射到
+            // 独立物理页上的 `GUEST_STUB_CODE`（xor rax,rax; vmcall; 死循环），作为最小 guest 入口。
             core::ptr::copy_nonoverlapping(GUEST_STUB_CODE.as_ptr(), guest_stub, GUEST_STUB_CODE.len());
+            vmcs::prepare_msr_auto_lists(msr_auto);
         }
 
         let Some(fixed) = VmxFixedMsrs::read() else {
@@ -265,6 +294,7 @@ impl VmxCluster {
                 free_contiguous_page(msr_bitmap);
                 free_contiguous_page(host_stack);
                 free_contiguous_page(guest_stub);
+                free_contiguous_page(msr_auto);
             }
             return wdk_sys::STATUS_NOT_SUPPORTED;
         };
@@ -277,6 +307,7 @@ impl VmxCluster {
                 free_contiguous_page(msr_bitmap);
                 free_contiguous_page(host_stack);
                 free_contiguous_page(guest_stub);
+                free_contiguous_page(msr_auto);
             }
             return wdk_sys::STATUS_NOT_SUPPORTED;
         }
@@ -294,6 +325,7 @@ impl VmxCluster {
         cpu.msr_bitmap_phys = msr_bitmap_phys;
         cpu.host_stack_page = host_stack;
         cpu.guest_stub_page = guest_stub;
+        cpu.msr_auto_page = msr_auto;
         cpu.ept = ept;
 
         if !unsafe { vmx::vmxon(&raw const cpu.vmxon_phys) } {
@@ -325,12 +357,17 @@ impl VmxCluster {
             return wdk_sys::STATUS_UNSUCCESSFUL;
         }
 
-        if let Err(err) = unsafe {
-            vmcs::configure_control_fields(
-                Some(cpu.msr_bitmap_phys),
-                cpu.ept.as_ref().map(|v| v.eptp.0),
-            )
-        } {
+        let msr_auto_phys = unsafe { mm::physical_address(msr_auto) };
+        let system_cr3 = introspection::query_process_cr3(4).unwrap_or_else(arch::read_cr3);
+        let ctrl_params = vmcs::VmcsControlParams {
+            msr_bitmap_pa: Some(cpu.msr_bitmap_phys),
+            eptp: cpu.ept.as_ref().map(|v| v.eptp.0),
+            vpid: (index + 1) as u16,
+            cr3_target: Some(system_cr3),
+            msr_exit_store_pa: msr_auto_phys,
+            msr_entry_load_pa: msr_auto_phys + 64,
+        };
+        if let Err(err) = unsafe { vmcs::configure_control_fields(&ctrl_params) } {
             logger::log_vmcs_error("configure_control_fields", vmcs::VmcsField::CTRL_CPU_BASED, err);
             let _ = unsafe { vmx::vmxoff() };
             unsafe {
@@ -352,7 +389,8 @@ impl VmxCluster {
             }
         }
 
-        let host_rsp = host_stack as u64 + 4096 - 0x20;
+        let host_rsp_top = host_stack as u64 + 4096;
+        let host_rsp = (host_rsp_top & !0xFu64).saturating_sub(8);
         let host_entry = vmexit::vmexit_host_stub as *const () as usize as u64;
         if let Err(err) = unsafe { vmcs::configure_host_state(host_entry, host_rsp) } {
             logger::log_vmcs_error("configure_host_state", vmcs::VmcsField::HOST_RIP, err);
@@ -433,34 +471,31 @@ impl VmxCluster {
             }
         }
 
-        match unsafe { vmcs::read_exit_reason() } {
-            Ok(reason) => {
-                logger::log_vm_exit_reason(reason.basic, reason.raw);
-                exit_handlers::log_basic_exit(reason.basic as u32);
-                let mut regs = GuestRegs {
-                    r15: 0,
-                    r14: 0,
-                    r13: 0,
-                    r12: 0,
-                    r11: 0,
-                    r10: 0,
-                    r9: 0,
-                    r8: 0,
-                    rdi: 0,
-                    rsi: 0,
-                    rbp: 0,
-                    rbx: 0,
-                    rdx: 0,
-                    rcx: 0,
-                    rax: 0,
-                };
-                if let Some(opt) = peek_session_for_dispatch() {
-                    exit_handlers::dispatch_vm_exit(opt, &mut regs, &reason, 0, 0);
+        if !unsafe { vm_launch::vmlaunch_enter_guest() } {
+            let inst_err = unsafe { vmcs::vmread(vmcs::VmcsField::VM_INSTRUCTION_ERROR) };
+            match inst_err {
+                Ok(c) => {
+                    wdk::println!(
+                        "[my-hv-driver] VMLAUNCH failed, VM_INSTRUCTION_ERROR=0x{:x}",
+                        c
+                    );
+                }
+                Err(e) => {
+                    logger::log_vmcs_error("vmread(VM_INSTRUCTION_ERROR)", vmcs::VmcsField::VM_INSTRUCTION_ERROR, e);
                 }
             }
-            Err(err) => {
-                logger::log_vmcs_error("vmread(EXIT_REASON)", vmcs::VmcsField::EXIT_REASON, err);
+            let _ = unsafe { vmx::vmxoff() };
+            unsafe {
+                arch::disable_vmx_hardware();
+                cpu.free_pages();
             }
+            return wdk_sys::STATUS_UNSUCCESSFUL;
+        }
+
+        let rax_ping = (HYPERCALL_KEY << 8) | (HypercallCode::Ping as u64);
+        let (ok, rax_out) = unsafe { vmx::vmcall(rax_ping, 0, 0) };
+        if ok && rax_out == HYPERVISOR_SIGNATURE {
+            wdk::println!("[my-hv-driver] post-VMLAUNCH PING returned hypervisor signature");
         }
 
         cpu.vmxon_done = true;
@@ -519,11 +554,3 @@ pub fn peek_session_for_dispatch() -> Option<&'static mut Option<VmxCluster>> {
     vmexit::peek_session_option_mut()
 }
 
-/// 在当前逻辑处理器上尝试 `VMLAUNCH`（成功则进入 guest，通常**不会**返回到此函数）。
-///
-/// 需已加载本驱动并完成 `IOCTL_HV_START`，且当前线程亲和到目标 CPU。仅 `--features experimental_vmentry` 可用。
-#[cfg(feature = "experimental_vmentry")]
-#[allow(dead_code)]
-pub unsafe fn debug_vmlaunch_on_this_cpu() -> bool {
-    unsafe { vmx::vmlaunch() }
-}

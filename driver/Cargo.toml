@@ -23,10 +23,6 @@ wdk-build = "0.5.1"
 wdk-panic = "0.4.1"
 wdk-sys = "0.5.1"
 
-[features]
-default = []
-experimental_vmentry = []
-
 [profile.dev]
 panic = "abort"
 

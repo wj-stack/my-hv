@@ -4,6 +4,7 @@
 use alloc::vec::Vec;
 
 use crate::mm::{self, free_contiguous_page};
+use crate::mtrr;
 use crate::vmx;
 
 pub const EPT_MEMTYPE_WB: u64 = 6;
@@ -68,10 +69,12 @@ pub struct EptState {
     pub mmr: [EptMmr; MAX_MMR],
 }
 
+/// 与 C++ `ept` 2MiB 大叶一致：`memory_type` 来自 MTRR（`ignore_pat` 不置位）。
 #[inline]
-fn ept_leaf_2mb(phys_2m_base: u64) -> u64 {
-    let aligned = phys_2m_base & !(SIZE_2M - 1);
-    aligned | EPT_R | EPT_W | EPT_X | EPT_LARGE | (EPT_MEMTYPE_WB << 3) | EPT_IGNORE_PAT
+fn ept_leaf_2mb_from_mtrr(gpa: u64, m: &mtrr::MtrrData) -> u64 {
+    let aligned = gpa & !(SIZE_2M - 1);
+    let mt = u64::from(mtrr::calc_mtrr_mem_type(m, gpa, SIZE_2M)) & 0x7;
+    aligned | EPT_R | EPT_W | EPT_X | EPT_LARGE | (mt << 3)
 }
 
 impl EptState {
@@ -95,12 +98,13 @@ impl EptState {
             }
         }
 
+        let mtrr = mtrr::read_mtrr_data();
         for pd_idx in 0..EPT_PD_COUNT {
             let pd = unsafe { base.add(4096 * (2 + pd_idx)).cast::<u64>() };
             for slot in 0..512 {
                 let gpa = (pd_idx as u64 * 512 + slot as u64).saturating_mul(SIZE_2M);
                 unsafe {
-                    pd.add(slot).write(ept_leaf_2mb(gpa));
+                    pd.add(slot).write(ept_leaf_2mb_from_mtrr(gpa, &mtrr));
                 }
             }
         }
@@ -141,16 +145,17 @@ impl EptState {
         unsafe { vmx::invept_single_context(self.eptp.0) }
     }
 
-    /// MTRR 变化后重刷 2MiB 叶项 memtype 字段（简化为保持 WB+IGNORE_PAT 并 `INVEPT`）。
+    /// 按当前 host MTRR 重算 2MiB 叶项并 `INVEPT`（对应 C++ `update_ept_memory_type` 的恒等大页路径）。
     pub fn refresh_all_memory_types(&mut self) {
         if self.table_base.is_null() {
             return;
         }
+        let mtrr = mtrr::read_mtrr_data();
         for pd_idx in 0..EPT_PD_COUNT {
             let pd = unsafe { self.table_base.add(4096 * (2 + pd_idx)).cast::<u64>() };
             for slot in 0..512 {
                 let gpa = (pd_idx as u64 * 512 + slot as u64) * SIZE_2M;
-                let leaf = ept_leaf_2mb(gpa);
+                let leaf = ept_leaf_2mb_from_mtrr(gpa, &mtrr);
                 unsafe {
                     pd.add(slot).write(leaf);
                 }

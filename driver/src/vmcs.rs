@@ -3,6 +3,31 @@
 use crate::{arch, ia32};
 use crate::{gdt, idt, segment};
 
+/// 与 `hv/hv/vmx.h` 中 `vmx_msr_entry` 一致：VM-exit MSR 存区 / VM-entry MSR 装区条目（16 字节）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VmxMsrEntry {
+    pub msr_index: u32,
+    pub reserved: u32,
+    pub data: u64,
+}
+
+/// `write_vmcs_ctrl_fields` 中 VM-exit MSR store 条目数（TSC、PERF_GLOBAL、APERF、MPERF）。
+pub const VMX_MSR_AUTOSTORE_COUNT: u32 = 4;
+/// VM-entry MSR load 条目数（APERF、MPERF）。
+pub const VMX_MSR_AUTOLOAD_COUNT: u32 = 2;
+
+/// 供 `configure_control_fields` 使用，与 `hv/hv/vmcs.cpp::write_vmcs_ctrl_fields` 同序字段。
+pub struct VmcsControlParams {
+    pub msr_bitmap_pa: Option<u64>,
+    pub eptp: Option<u64>,
+    pub vpid: u16,
+    /// 与参考工程 `ghv.system_cr3` 一致：通常为 System 进程目录表；`None` 则不使用 CR3-target。
+    pub cr3_target: Option<u64>,
+    pub msr_exit_store_pa: u64,
+    pub msr_entry_load_pa: u64,
+}
+
 /// VMCS 字段编码（Intel SDM full encoding）。
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +58,12 @@ impl VmcsField {
     pub const CTRL_VMEXIT_MSR_STORE_COUNT: Self = Self(ia32::VMCS_CTRL_VMEXIT_MSR_STORE_COUNT);
     pub const CTRL_VMEXIT_MSR_LOAD_COUNT: Self = Self(ia32::VMCS_CTRL_VMEXIT_MSR_LOAD_COUNT);
     pub const CTRL_VMENTRY_MSR_LOAD_COUNT: Self = Self(ia32::VMCS_CTRL_VMENTRY_MSR_LOAD_COUNT);
+    pub const CTRL_CR0_GUEST_HOST_MASK: Self = Self(ia32::VMCS_CTRL_CR0_GUEST_HOST_MASK);
+    pub const CTRL_CR4_GUEST_HOST_MASK: Self = Self(ia32::VMCS_CTRL_CR4_GUEST_HOST_MASK);
+    pub const CTRL_CR3_TARGET_VALUE0: Self = Self(ia32::VMCS_CTRL_CR3_TARGET_VALUE0);
+    pub const CTRL_VIRTUAL_PROCESSOR_ID: Self = Self(ia32::VMCS_CTRL_VIRTUAL_PROCESSOR_ID);
+    pub const CTRL_VMEXIT_MSR_STORE_ADDRESS: Self = Self(ia32::VMCS_CTRL_VMEXIT_MSR_STORE_ADDRESS);
+    pub const CTRL_VMENTRY_MSR_LOAD_ADDRESS: Self = Self(ia32::VMCS_CTRL_VMENTRY_MSR_LOAD_ADDRESS);
     pub const HOST_CR0: Self = Self(ia32::VMCS_HOST_CR0);
     pub const HOST_CR3: Self = Self(ia32::VMCS_HOST_CR3);
     pub const HOST_CR4: Self = Self(ia32::VMCS_HOST_CR4);
@@ -47,6 +78,8 @@ impl VmcsField {
     pub const GUEST_DEBUGCTL: Self = Self(ia32::VMCS_GUEST_DEBUGCTL);
     pub const GUEST_PAT: Self = Self(ia32::VMCS_GUEST_PAT);
     pub const GUEST_EFER: Self = Self(ia32::VMCS_GUEST_EFER);
+    pub const GUEST_IA32_PERF_GLOBAL_CTRL: Self = Self(ia32::VMCS_GUEST_IA32_PERF_GLOBAL_CTRL);
+    pub const GUEST_PENDING_DEBUG_EXCEPTIONS: Self = Self(ia32::VMCS_GUEST_PENDING_DEBUG_EXCEPTIONS);
     pub const GUEST_ES_SELECTOR: Self = Self(ia32::VMCS_GUEST_ES_SELECTOR);
     pub const GUEST_CS_SELECTOR: Self = Self(ia32::VMCS_GUEST_CS_SELECTOR);
     pub const GUEST_SS_SELECTOR: Self = Self(ia32::VMCS_GUEST_SS_SELECTOR);
@@ -103,11 +136,13 @@ impl VmcsField {
     pub const HOST_IA32_SYSENTER_EIP: Self = Self(ia32::VMCS_HOST_IA32_SYSENTER_EIP);
     pub const HOST_PAT: Self = Self(ia32::VMCS_HOST_PAT);
     pub const HOST_EFER: Self = Self(ia32::VMCS_HOST_EFER);
+    pub const HOST_IA32_PERF_GLOBAL_CTRL: Self = Self(ia32::VMCS_HOST_IA32_PERF_GLOBAL_CTRL);
     pub const EXIT_QUALIFICATION: Self = Self(ia32::VMCS_EXIT_QUALIFICATION);
     pub const VMEXIT_INSTRUCTION_LEN: Self = Self(ia32::VMCS_VM_EXIT_INSTRUCTION_LEN);
     pub const VMEXIT_INTERRUPTION_INFO: Self = Self(ia32::VMCS_VMEXIT_INTERRUPTION_INFO);
     pub const VMENTRY_INTERRUPTION_INFO: Self = Self(ia32::VMCS_VMENTRY_INTERRUPTION_INFO);
     pub const VMENTRY_EXCEPTION_ERROR_CODE: Self = Self(ia32::VMCS_VMENTRY_EXCEPTION_ERROR_CODE);
+    pub const VMENTRY_INSTRUCTION_LEN: Self = Self(ia32::VMCS_VMENTRY_INSTRUCTION_LEN);
     pub const GUEST_PHYSICAL_ADDRESS: Self = Self(ia32::VMCS_GUEST_PHYSICAL_ADDRESS);
     pub const GUEST_LINEAR_ADDRESS: Self = Self(ia32::VMCS_GUEST_LINEAR_ADDRESS);
     pub const GUEST_VMX_PREEMPTION_TIMER: Self = Self(ia32::VMCS_GUEST_VMX_PREEMPTION_TIMER);
@@ -408,11 +443,11 @@ fn control_msr(use_true: u64, true_msr: u32, fallback: u32) -> u32 {
     ia32::vmx_true_controls_msr_or_default(use_true, true_msr, fallback)
 }
 
-/// 根据 VMX capability MSR 约束计算控制值并写入 VMCS。
+/// 根据 VMX capability MSR 约束计算控制值并写入 VMCS（对齐 `hv/hv/vmcs.cpp::write_vmcs_ctrl_fields`）。
 ///
 /// # Safety
 /// 需要已 `VMPTRLD`。
-pub unsafe fn configure_control_fields(maybe_msr_bitmap_pa: Option<u64>, maybe_eptp: Option<u64>) -> Result<(), VmcsAccessError> {
+pub unsafe fn configure_control_fields(params: &VmcsControlParams) -> Result<(), VmcsAccessError> {
     let basic = unsafe { arch::rdmsr(ia32::IA32_VMX_BASIC) };
 
     let pin_msr = control_msr(
@@ -436,45 +471,58 @@ pub unsafe fn configure_control_fields(maybe_msr_bitmap_pa: Option<u64>, maybe_e
         ia32::IA32_VMX_ENTRY_CTLS,
     );
 
-    let pin = ia32::adjust_vmx_control(ia32::PIN_BASED_NMI_EXITING, unsafe { arch::rdmsr(pin_msr) });
+    let pin_req = ia32::PIN_BASED_NMI_EXITING
+        | ia32::PIN_BASED_VIRTUAL_NMI
+        | ia32::PIN_BASED_ACTIVATE_VMX_PREEMPTION_TIMER;
+    let pin = ia32::adjust_vmx_control(pin_req, unsafe { arch::rdmsr(pin_msr) });
+
     let primary_requested = ia32::CPU_BASED_USE_MSR_BITMAPS
         | ia32::CPU_BASED_ACTIVATE_SECONDARY_CONTROLS
+        | ia32::CPU_BASED_USE_TSC_OFFSETTING
         | ia32::CPU_BASED_CPUID_EXITING
         | ia32::CPU_BASED_HLT_EXITING
         | ia32::CPU_BASED_RDTSC_EXITING
         | ia32::CPU_BASED_RDMSR_EXITING
         | ia32::CPU_BASED_WRMSR_EXITING
         | ia32::CPU_BASED_CR3_LOAD_EXITING
-        | ia32::CPU_BASED_CR3_STORE_EXITING
         | ia32::CPU_BASED_CR0_LOAD_EXITING
         | ia32::CPU_BASED_CR0_STORE_EXITING
         | ia32::CPU_BASED_CR4_LOAD_EXITING
         | ia32::CPU_BASED_CR4_STORE_EXITING;
     let primary = ia32::adjust_vmx_control(primary_requested, unsafe { arch::rdmsr(proc_msr) });
+
     let exit_ctrl = ia32::adjust_vmx_control(
         ia32::EXIT_CONTROL_HOST_ADDR_SPACE_SIZE
+            | ia32::EXIT_CONTROL_SAVE_DEBUG_CONTROLS
             | ia32::EXIT_CONTROL_SAVE_IA32_PAT
             | ia32::EXIT_CONTROL_LOAD_IA32_PAT
             | ia32::EXIT_CONTROL_SAVE_IA32_EFER
-            | ia32::EXIT_CONTROL_LOAD_IA32_EFER,
+            | ia32::EXIT_CONTROL_LOAD_IA32_EFER
+            | ia32::EXIT_CONTROL_LOAD_IA32_PERF_GLOBAL_CTRL,
         unsafe { arch::rdmsr(exit_msr) },
     );
     let entry_ctrl = ia32::adjust_vmx_control(
         ia32::ENTRY_CONTROL_IA32E_MODE_GUEST
+            | ia32::ENTRY_CONTROL_LOAD_DEBUG_CONTROLS
             | ia32::ENTRY_CONTROL_LOAD_IA32_PAT
-            | ia32::ENTRY_CONTROL_LOAD_IA32_EFER,
+            | ia32::ENTRY_CONTROL_LOAD_IA32_EFER
+            | ia32::ENTRY_CONTROL_LOAD_IA32_PERF_GLOBAL_CTRL,
         unsafe { arch::rdmsr(entry_msr) },
     );
+
     let mut secondary_req = ia32::SECONDARY_CONTROL_ENABLE_RDTSCP
         | ia32::SECONDARY_CONTROL_ENABLE_INVPCID
         | ia32::SECONDARY_CONTROL_ENABLE_XSAVES_XRSTORS;
-    if maybe_eptp.is_some() {
-        secondary_req |= ia32::SECONDARY_CONTROL_ENABLE_EPT;
+    if params.eptp.is_some() {
+        secondary_req |= ia32::SECONDARY_CONTROL_ENABLE_EPT | ia32::SECONDARY_CONTROL_ENABLE_VPID;
     }
     let secondary = ia32::adjust_vmx_control(
         secondary_req,
         unsafe { arch::rdmsr(ia32::IA32_VMX_PROCBASED_CTLS2) },
     );
+
+    let cr0_mask = !0u64;
+    let cr4_mask = !0u64;
 
     unsafe {
         vmwrite(VmcsField::CTRL_PIN_BASED, pin as u64)?;
@@ -483,23 +531,93 @@ pub unsafe fn configure_control_fields(maybe_msr_bitmap_pa: Option<u64>, maybe_e
         vmwrite(VmcsField::CTRL_VMEXIT_CONTROLS, exit_ctrl as u64)?;
         vmwrite(VmcsField::CTRL_VMENTRY_CONTROLS, entry_ctrl as u64)?;
         vmwrite(VmcsField::CTRL_EXCEPTION_BITMAP, 0)?;
-        vmwrite(VmcsField::CTRL_CR3_TARGET_COUNT, 0)?;
         vmwrite(VmcsField::CTRL_PAGEFAULT_ERROR_CODE_MASK, 0)?;
         vmwrite(VmcsField::CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0)?;
         vmwrite(VmcsField::CTRL_TSC_OFFSET, 0)?;
-        vmwrite(VmcsField::CTRL_VMEXIT_MSR_STORE_COUNT, 0)?;
-        vmwrite(VmcsField::CTRL_VMEXIT_MSR_LOAD_COUNT, 0)?;
-        vmwrite(VmcsField::CTRL_VMENTRY_MSR_LOAD_COUNT, 0)?;
-    }
 
-    if let Some(msr_bitmap) = maybe_msr_bitmap_pa {
-        unsafe { vmwrite(VmcsField::CTRL_MSR_BITMAP_ADDRESS, msr_bitmap)? };
-    }
-    if let Some(eptp) = maybe_eptp {
-        unsafe { vmwrite(VmcsField::CTRL_EPT_POINTER, eptp)? };
+        vmwrite(VmcsField::CTRL_CR0_GUEST_HOST_MASK, cr0_mask)?;
+        vmwrite(VmcsField::CTRL_CR4_GUEST_HOST_MASK, cr4_mask)?;
+        vmwrite(VmcsField::CTRL_CR0_READ_SHADOW, arch::read_cr0())?;
+        vmwrite(VmcsField::CTRL_CR4_READ_SHADOW, arch::read_cr4() & !CR4_VMXE)?;
+
+        if let Some(cr3) = params.cr3_target {
+            vmwrite(VmcsField::CTRL_CR3_TARGET_COUNT, 1)?;
+            vmwrite(VmcsField::CTRL_CR3_TARGET_VALUE0, cr3)?;
+        } else {
+            vmwrite(VmcsField::CTRL_CR3_TARGET_COUNT, 0)?;
+        }
+
+        if let Some(msr_bitmap) = params.msr_bitmap_pa {
+            vmwrite(VmcsField::CTRL_MSR_BITMAP_ADDRESS, msr_bitmap)?;
+        }
+        if let Some(eptp) = params.eptp {
+            vmwrite(VmcsField::CTRL_EPT_POINTER, eptp)?;
+        }
+
+        if params.eptp.is_some() {
+            vmwrite(VmcsField::CTRL_VIRTUAL_PROCESSOR_ID, u64::from(params.vpid))?;
+        }
+
+        vmwrite(
+            VmcsField::CTRL_VMEXIT_MSR_STORE_COUNT,
+            u64::from(VMX_MSR_AUTOSTORE_COUNT),
+        )?;
+        vmwrite(VmcsField::CTRL_VMEXIT_MSR_STORE_ADDRESS, params.msr_exit_store_pa)?;
+        vmwrite(VmcsField::CTRL_VMEXIT_MSR_LOAD_COUNT, 0)?;
+        vmwrite(
+            VmcsField::CTRL_VMENTRY_MSR_LOAD_COUNT,
+            u64::from(VMX_MSR_AUTOLOAD_COUNT),
+        )?;
+        vmwrite(VmcsField::CTRL_VMENTRY_MSR_LOAD_ADDRESS, params.msr_entry_load_pa)?;
+
+        vmwrite(VmcsField::VMENTRY_INTERRUPTION_INFO, 0)?;
+        vmwrite(VmcsField::VMENTRY_EXCEPTION_ERROR_CODE, 0)?;
+        vmwrite(VmcsField::VMENTRY_INSTRUCTION_LEN, 0)?;
     }
 
     Ok(())
+}
+
+/// 填充 MSR 自动列表（`hv/hv/vmcs.cpp` 中 `msr_exit_store` / `msr_entry_load`）。
+///
+/// # Safety
+/// `page` 至少 96 字节可写；调用方可置于独立 4K 页首。
+pub unsafe fn prepare_msr_auto_lists(page: *mut u8) {
+    let store = page.cast::<VmxMsrEntry>();
+    unsafe {
+        store.write(VmxMsrEntry {
+            msr_index: ia32::IA32_TIME_STAMP_COUNTER,
+            reserved: 0,
+            data: 0,
+        });
+        store.add(1).write(VmxMsrEntry {
+            msr_index: ia32::IA32_PERF_GLOBAL_CTRL,
+            reserved: 0,
+            data: 0,
+        });
+        store.add(2).write(VmxMsrEntry {
+            msr_index: ia32::IA32_APERF,
+            reserved: 0,
+            data: 0,
+        });
+        store.add(3).write(VmxMsrEntry {
+            msr_index: ia32::IA32_MPERF,
+            reserved: 0,
+            data: 0,
+        });
+
+        let load = page.add(64).cast::<VmxMsrEntry>();
+        load.write(VmxMsrEntry {
+            msr_index: ia32::IA32_APERF,
+            reserved: 0,
+            data: arch::rdmsr(ia32::IA32_APERF),
+        });
+        load.add(1).write(VmxMsrEntry {
+            msr_index: ia32::IA32_MPERF,
+            reserved: 0,
+            data: arch::rdmsr(ia32::IA32_MPERF),
+        });
+    }
 }
 
 /// 写入最小 host 字段（仅用于后续 VM-entry 路径打底）。
@@ -514,25 +632,30 @@ pub unsafe fn configure_host_state(host_rip: u64, host_rsp: u64) -> Result<(), V
     let idtr_base = unsafe { core::ptr::addr_of!(idtr.base).read_unaligned() };
     let sel = segment::read_segment_selectors();
     let tr = segment::parse_segment(&gdtr, sel.tr);
+    let mut cr4 = arch::read_cr4();
+    cr4 |= 1 << 16;
+    cr4 |= 1 << 18;
+    cr4 &= !(1 << 20);
+    cr4 &= !(1 << 21);
     unsafe {
         vmwrite(VmcsField::HOST_CR0, arch::read_cr0())?;
         vmwrite(VmcsField::HOST_CR3, arch::read_cr3())?;
-        vmwrite(VmcsField::HOST_CR4, arch::read_cr4())?;
+        vmwrite(VmcsField::HOST_CR4, cr4)?;
         vmwrite(VmcsField::HOST_RIP, host_rip)?;
         vmwrite(VmcsField::HOST_RSP, host_rsp)?;
         vmwrite(VmcsField::HOST_GDTR_BASE, gdtr_base)?;
         vmwrite(VmcsField::HOST_IDTR_BASE, idtr_base)?;
 
-        vmwrite(VmcsField::HOST_ES_SELECTOR, sel.es as u64)?;
+        vmwrite(VmcsField::HOST_ES_SELECTOR, 0)?;
         vmwrite(VmcsField::HOST_CS_SELECTOR, sel.cs as u64)?;
-        vmwrite(VmcsField::HOST_SS_SELECTOR, sel.ss as u64)?;
-        vmwrite(VmcsField::HOST_DS_SELECTOR, sel.ds as u64)?;
-        vmwrite(VmcsField::HOST_FS_SELECTOR, sel.fs as u64)?;
-        vmwrite(VmcsField::HOST_GS_SELECTOR, sel.gs as u64)?;
+        vmwrite(VmcsField::HOST_SS_SELECTOR, 0)?;
+        vmwrite(VmcsField::HOST_DS_SELECTOR, 0)?;
+        vmwrite(VmcsField::HOST_FS_SELECTOR, 0)?;
+        vmwrite(VmcsField::HOST_GS_SELECTOR, 0)?;
         vmwrite(VmcsField::HOST_TR_SELECTOR, sel.tr as u64)?;
 
         vmwrite(VmcsField::HOST_FS_BASE, unsafe { arch::rdmsr(ia32::IA32_FS_BASE) })?;
-        vmwrite(VmcsField::HOST_GS_BASE, unsafe { arch::rdmsr(ia32::IA32_GS_BASE) })?;
+        vmwrite(VmcsField::HOST_GS_BASE, 0)?;
         vmwrite(VmcsField::HOST_TR_BASE, tr.base)?;
 
         vmwrite(
@@ -550,6 +673,7 @@ pub unsafe fn configure_host_state(host_rip: u64, host_rsp: u64) -> Result<(), V
 
         vmwrite(VmcsField::HOST_PAT, unsafe { arch::rdmsr(ia32::IA32_PAT) })?;
         vmwrite(VmcsField::HOST_EFER, unsafe { arch::read_msr_efer() })?;
+        vmwrite(VmcsField::HOST_IA32_PERF_GLOBAL_CTRL, 0)?;
     }
     Ok(())
 }
@@ -563,9 +687,16 @@ pub unsafe fn configure_guest_state() -> Result<(), VmcsAccessError> {
         vmwrite(VmcsField::GUEST_CR0, arch::read_cr0())?;
         vmwrite(VmcsField::GUEST_CR3, arch::read_cr3())?;
         vmwrite(VmcsField::GUEST_CR4, arch::read_cr4())?;
-        vmwrite(VmcsField::GUEST_DR7, 0x400)?;
+        vmwrite(VmcsField::GUEST_DR7, arch::read_dr7())?;
+        vmwrite(
+            VmcsField::GUEST_IA32_PERF_GLOBAL_CTRL,
+            arch::rdmsr(ia32::IA32_PERF_GLOBAL_CTRL),
+        )?;
         vmwrite(VmcsField::GUEST_VMCS_LINK_POINTER, ia32::MAXULONG64)?;
         vmwrite(VmcsField::GUEST_ACTIVITY_STATE, 0)?;
+        vmwrite(VmcsField::GUEST_INTERRUPTIBILITY_STATE, 0)?;
+        vmwrite(VmcsField::GUEST_PENDING_DEBUG_EXCEPTIONS, 0)?;
+        vmwrite(VmcsField::GUEST_VMX_PREEMPTION_TIMER, ia32::MAXULONG64)?;
     }
     Ok(())
 }

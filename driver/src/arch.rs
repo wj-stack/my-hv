@@ -67,6 +67,13 @@ pub fn read_cr4() -> u64 {
     v
 }
 
+/// 当前 `DR7`（与 `hv/hv/vmcs.cpp::write_vmcs_guest_fields` 中 `__readdr(7)` 一致）。
+pub fn read_dr7() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mov {}, dr7", out(reg) v) };
+    v
+}
+
 pub unsafe fn write_cr0(v: u64) {
     unsafe { core::arch::asm!("mov cr0, {}", in(reg) v) };
 }

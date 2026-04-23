@@ -131,7 +131,7 @@ fn handle_wrmsr(cl: &mut VmxCluster, regs: &mut GuestRegs) {
     if mtrr::is_mtrr_msr(msr) {
         if let Some(cpu) = cl.current_cpu_mut() {
             if let Some(ref mut e) = cpu.ept {
-                unsafe { mtrr::on_mtrr_msr_write(e) };
+                e.refresh_all_memory_types();
             }
         }
     }

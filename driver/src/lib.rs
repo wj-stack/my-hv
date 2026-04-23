@@ -47,6 +47,7 @@ mod timing;
 mod vmcs;
 mod vmexit;
 mod vcpu;
+mod vm_launch;
 mod vmx;
 
 use shared_contract::{
@@ -188,22 +189,6 @@ unsafe extern "C" fn dispatch_device_control(
                 return unsafe { complete_request(irp, STATUS_UNSUCCESSFUL, 0) };
             }
             unsafe { complete_request(irp, STATUS_SUCCESS, input_len) }
-        }
-        IOCTL_HV_START => {
-            let status = unsafe { hv_try_start() };
-            unsafe { complete_request(irp, status, 0) }
-        }
-        IOCTL_HV_STOP => {
-            let status = unsafe {
-                with_session(|session| {
-                    crate::vmexit::clear_vmexit_session();
-                    if let Some(mut c) = session.take() {
-                        c.stop();
-                    }
-                    STATUS_SUCCESS
-                })
-            };
-            unsafe { complete_request(irp, status, 0) }
         }
         IOCTL_HV_HYPERCALL => {
             if input_len < size_of::<HvHypercallIn>() || output_len < size_of::<HvHypercallOut>() {
