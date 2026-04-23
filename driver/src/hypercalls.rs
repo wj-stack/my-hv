@@ -5,7 +5,6 @@ use shared_contract::{
     STATUS_INVALID_PARAMETER, STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS,
 };
 
-use crate::ept::EptState;
 use crate::introspection;
 use crate::logger;
 use crate::mm;
@@ -88,21 +87,17 @@ pub fn dispatch(cluster: &mut Option<VmxCluster>, inp: &HvHypercallIn) -> HvHype
         HypercallCode::ReadVirtMem => handle_read_virt(inp),
         HypercallCode::WriteVirtMem => handle_write_virt(inp),
         HypercallCode::QueryProcessCr3 => handle_query_process_cr3(inp),
-        HypercallCode::InstallEptHook => handle_install_ept_hook(),
-        HypercallCode::RemoveEptHook => handle_remove_ept_hook(),
+        HypercallCode::InstallEptHook => handle_install_ept_hook(cluster, inp),
+        HypercallCode::RemoveEptHook => handle_remove_ept_hook(cluster, inp),
         HypercallCode::GetHvBase => handle_get_hv_base(),
         HypercallCode::FlushLogs => handle_flush_logs(),
         HypercallCode::GetPhysicalAddress => handle_get_physical_address(inp),
-        HypercallCode::HidePhysicalPage => handle_hide_physical_page(),
-        HypercallCode::UnhidePhysicalPage => handle_unhide_physical_page(),
-        HypercallCode::InstallMmr => handle_install_mmr(),
-        HypercallCode::RemoveMmr => handle_remove_mmr(),
-        HypercallCode::RemoveAllMmrs => handle_remove_all_mmrs(),
-        HypercallCode::Test => HvHypercallOut {
-            status: STATUS_SUCCESS,
-            rax: 0,
-            _reserved: 0,
-        },
+        HypercallCode::HidePhysicalPage => handle_hide_physical_page(cluster, inp),
+        HypercallCode::UnhidePhysicalPage => handle_unhide_physical_page(cluster, inp),
+        HypercallCode::InstallMmr => handle_install_mmr(cluster, inp),
+        HypercallCode::RemoveMmr => handle_remove_mmr(cluster, inp),
+        HypercallCode::RemoveAllMmrs => handle_remove_all_mmrs(cluster),
+        HypercallCode::Test => handle_test_hv(),
     }
 }
 
@@ -250,37 +245,172 @@ fn handle_get_physical_address(inp: &HvHypercallIn) -> HvHypercallOut {
     ok_with_rax(pa)
 }
 
-fn handle_install_ept_hook() -> HvHypercallOut {
-    // SAFETY: 仅分配/释放最小 EPT 骨架用于路径连通性验证。
-    let mut ept = match unsafe { EptState::build_identity_skeleton() } {
-        Some(v) => v,
-        None => return invalid_parameter(),
+fn handle_test_hv() -> HvHypercallOut {
+    let b = core::ptr::addr_of!(__ImageBase) as u64;
+    logger::log("TEST: hypervisor image (hv-ping / introspection path)");
+    ok_with_rax(b)
+}
+
+fn handle_install_ept_hook(cluster: &mut Option<VmxCluster>, inp: &HvHypercallIn) -> HvHypercallOut {
+    let orig_pfn = inp.args[0];
+    let exec_pfn = inp.args[1];
+    let Some(c) = cluster else {
+        return HvHypercallOut {
+            status: STATUS_NOT_IMPLEMENTED,
+            rax: 0,
+            _reserved: 0,
+        };
     };
-    let eptp = ept.eptp.0;
-    unsafe { ept.release() };
-    ok_with_rax(eptp)
+    let Some(cpu) = c.current_cpu_mut() else {
+        return invalid_parameter();
+    };
+    let Some(ref mut ept) = cpu.ept else {
+        return invalid_parameter();
+    };
+    for i in 0..ept.hooks.len() {
+        if !ept.hooks[i].active {
+            ept.hooks[i].orig_page_pfn = orig_pfn as u32;
+            ept.hooks[i].exec_page_pfn = exec_pfn as u32;
+            ept.hooks[i].active = true;
+            let gpa = orig_pfn.saturating_mul(4096);
+            if unsafe { ept.clear_execute_for_page(gpa) } {
+                return ok_with_rax(1);
+            }
+            ept.hooks[i].active = false;
+            return invalid_parameter();
+        }
+    }
+    invalid_parameter()
 }
 
-fn handle_remove_ept_hook() -> HvHypercallOut {
+fn handle_remove_ept_hook(cluster: &mut Option<VmxCluster>, inp: &HvHypercallIn) -> HvHypercallOut {
+    let pfn = inp.args[0] as u32;
+    let Some(c) = cluster else {
+        return HvHypercallOut {
+            status: STATUS_NOT_IMPLEMENTED,
+            rax: 0,
+            _reserved: 0,
+        };
+    };
+    let Some(cpu) = c.current_cpu_mut() else {
+        return invalid_parameter();
+    };
+    let Some(ref mut e) = cpu.ept else {
+        return invalid_parameter();
+    };
+    for h in e.hooks.iter_mut() {
+        if h.active && h.orig_page_pfn == pfn {
+            h.active = false;
+            e.refresh_all_memory_types();
+            return ok_with_rax(1);
+        }
+    }
+    ok_with_rax(0)
+}
+
+fn handle_hide_physical_page(cluster: &mut Option<VmxCluster>, inp: &HvHypercallIn) -> HvHypercallOut {
+    let gpa = inp.args[0];
+    let Some(c) = cluster else {
+        return HvHypercallOut {
+            status: STATUS_NOT_IMPLEMENTED,
+            rax: 0,
+            _reserved: 0,
+        };
+    };
+    let Some(cpu) = c.current_cpu_mut() else {
+        return invalid_parameter();
+    };
+    let Some(ref mut e) = cpu.ept else {
+        return invalid_parameter();
+    };
+    if unsafe { e.point_gpa_to_dummy(gpa) } {
+        ok_with_rax(1)
+    } else {
+        invalid_parameter()
+    }
+}
+
+fn handle_unhide_physical_page(cluster: &mut Option<VmxCluster>, inp: &HvHypercallIn) -> HvHypercallOut {
+    let gpa = inp.args[0];
+    let _ = (cluster, gpa, inp);
     ok_with_rax(1)
 }
 
-fn handle_hide_physical_page() -> HvHypercallOut {
-    ok_with_rax(1)
+fn handle_install_mmr(cluster: &mut Option<VmxCluster>, inp: &HvHypercallIn) -> HvHypercallOut {
+    let start = inp.args[0];
+    let size = inp.args[1] as u32;
+    let mode = inp.args[2] as u8;
+    let Some(c) = cluster else {
+        return HvHypercallOut {
+            status: STATUS_NOT_IMPLEMENTED,
+            rax: 0,
+            _reserved: 0,
+        };
+    };
+    let Some(cpu) = c.current_cpu_mut() else {
+        return invalid_parameter();
+    };
+    let Some(ref mut e) = cpu.ept else {
+        return invalid_parameter();
+    };
+    for s in e.mmr.iter_mut() {
+        if !s.in_use {
+            s.start_gpa = start;
+            s.size = size;
+            s.read = (mode & 1) != 0;
+            s.write = (mode & 2) != 0;
+            s.execute = (mode & 4) != 0;
+            s.in_use = true;
+            return ok_with_rax(1);
+        }
+    }
+    invalid_parameter()
 }
 
-fn handle_unhide_physical_page() -> HvHypercallOut {
-    ok_with_rax(1)
+fn handle_remove_mmr(cluster: &mut Option<VmxCluster>, inp: &HvHypercallIn) -> HvHypercallOut {
+    let start = inp.args[0];
+    let Some(c) = cluster else {
+        return HvHypercallOut {
+            status: STATUS_NOT_IMPLEMENTED,
+            rax: 0,
+            _reserved: 0,
+        };
+    };
+    let Some(cpu) = c.current_cpu_mut() else {
+        return invalid_parameter();
+    };
+    let Some(ref mut e) = cpu.ept else {
+        return invalid_parameter();
+    };
+    for s in e.mmr.iter_mut() {
+        if s.in_use && s.start_gpa == start {
+            s.in_use = false;
+            s.size = 0;
+            return ok_with_rax(1);
+        }
+    }
+    ok_with_rax(0)
 }
 
-fn handle_install_mmr() -> HvHypercallOut {
-    ok_with_rax(1)
-}
-
-fn handle_remove_mmr() -> HvHypercallOut {
-    ok_with_rax(1)
-}
-
-fn handle_remove_all_mmrs() -> HvHypercallOut {
+fn handle_remove_all_mmrs(cluster: &mut Option<VmxCluster>) -> HvHypercallOut {
+    let Some(c) = cluster else {
+        return HvHypercallOut {
+            status: STATUS_NOT_IMPLEMENTED,
+            rax: 0,
+            _reserved: 0,
+        };
+    };
+    let Some(cpu) = c.current_cpu_mut() else {
+        return invalid_parameter();
+    };
+    let Some(ref mut e) = cpu.ept else {
+        return invalid_parameter();
+    };
+    for s in e.mmr.iter_mut() {
+        s.in_use = false;
+        s.size = 0;
+    }
+    let _ = e;
+    let _ = cpu;
     ok_with_rax(1)
 }

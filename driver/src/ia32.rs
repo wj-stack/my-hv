@@ -21,8 +21,10 @@ pub const IA32_VMX_CR4_FIXED0: u32 = 0x0000_00_48 + 0x0C;
 pub const IA32_VMX_CR4_FIXED1: u32 = 0x0000_00_48 + 0x0D;
 pub const IA32_VMX_EPT_VPID_CAP: u32 = 0x0000_00_48 + 0x10;
 
-/// VMX basic exit: VMCALL (18).
+/// VMX basic exit: VMCALL (18)。
 pub const VMX_EXIT_REASON_EXECUTE_VMCALL: u32 = 18;
+/// 与 `VMX_EXIT_REASON_EXECUTE_VMCALL` 同义（参考 `hv` 命名）。
+pub const VMX_EXIT_REASON_VMCALL: u32 = 18;
 pub const VMX_EXIT_REASON_CPUID: u32 = 10;
 pub const VMX_EXIT_REASON_RDMSR: u32 = 31;
 pub const VMX_EXIT_REASON_WRMSR: u32 = 32;
@@ -31,7 +33,46 @@ pub const VMX_EXIT_REASON_EXCEPTION_NMI: u32 = 0;
 pub const VMX_EXIT_REASON_EPT_VIOLATION: u32 = 48;
 pub const VMX_EXIT_REASON_PREEMPTION_TIMER: u32 = 52;
 pub const VMX_EXIT_REASON_HLT: u32 = 12;
+/// 与 `VMX_EXIT_REASON_EXCEPTION_NMI` 同义（参考 `hv` 命名）。
+pub const VMX_EXIT_REASON_EXCEPTION_OR_NMI: u32 = 0;
+pub const VMX_EXIT_REASON_EXTERNAL_INTERRUPT: u32 = 1;
+pub const VMX_EXIT_REASON_TRIPLE_FAULT: u32 = 2;
+pub const VMX_EXIT_REASON_NMI_WINDOW: u32 = 8;
+pub const VMX_EXIT_REASON_TASK_SWITCH: u32 = 9;
+/// GETSEC（无条件 VM exit，SDM 表 C-1）
+pub const VMX_EXIT_REASON_VMX_GETSEC: u32 = 11;
+pub const VMX_EXIT_REASON_INVD: u32 = 13;
+pub const VMX_EXIT_REASON_VMXON: u32 = 19;
+pub const VMX_EXIT_REASON_VMLAUNCH: u32 = 20;
+pub const VMX_EXIT_REASON_VMPTRST: u32 = 23;
+pub const VMX_EXIT_REASON_VMPTRLD: u32 = 21;
+pub const VMX_EXIT_REASON_VMCLEAR: u32 = 22;
+pub const VMX_EXIT_REASON_VMREAD: u32 = 24;
+pub const VMX_EXIT_REASON_VMWRITE: u32 = 25;
+pub const VMX_EXIT_REASON_VMXOFF: u32 = 27;
+pub const VMX_EXIT_REASON_VMRESUME: u32 = 26;
+pub const VMX_EXIT_REASON_MWAIT: u32 = 36;
+pub const VMX_EXIT_REASON_MONITOR: u32 = 39;
+pub const VMX_EXIT_REASON_PAUSE: u32 = 40;
+pub const VMX_EXIT_REASON_INVEPT: u32 = 50;
+pub const VMX_EXIT_REASON_RDTSC: u32 = 16;
+pub const VMX_EXIT_REASON_RDTSCP: u32 = 41;
+pub const VMX_EXIT_REASON_XSETBV: u32 = 55;
+pub const VMX_EXIT_REASON_INVPCID: u32 = 58;
+pub const VMX_EXIT_REASON_VMFUNC: u32 = 59;
+pub const VMX_EXIT_REASON_INVVPID: u32 = 53;
+pub const VMX_EXIT_REASON_EPT_MISCONFIG: u32 = 49;
+pub const VMX_EXIT_REASON_MONITOR_TRAP_FLAG: u32 = 37;
+pub const VMX_EXIT_REASON_WBINVD: u32 = 54;
+/// VMX 抢占定时器
+pub const VMX_EXIT_REASON_VMX_PREEMPTION_TIMER: u32 = 52;
+
 pub const MAXULONG64: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+/// 异常向量（#UD=6, #GP=13, #PF=14）。
+pub const X86_VECTOR_UD: u32 = 6;
+pub const X86_VECTOR_GP: u32 = 13;
+pub const X86_VECTOR_PF: u32 = 14;
 
 // --- MSRs mirrored into guest VMCS ---
 pub const IA32_DEBUGCTL: u32 = 0x1D9;
@@ -141,6 +182,16 @@ pub const VMCS_GUEST_GDTR_BASE: u32 = 0x0000_6816;
 pub const VMCS_GUEST_IDTR_BASE: u32 = 0x0000_6818;
 pub const VMCS_GUEST_IA32_SYSENTER_ESP: u32 = 0x0000_6824;
 pub const VMCS_GUEST_IA32_SYSENTER_EIP: u32 = 0x0000_6826;
+/// VM-entry interruption-information / exception error code（SDM 24.8.3）。
+pub const VMCS_VMENTRY_INTERRUPTION_INFO: u32 = 0x0000_4016;
+pub const VMCS_VMENTRY_EXCEPTION_ERROR_CODE: u32 = 0x0000_4018;
+pub const VMCS_GUEST_PHYSICAL_ADDRESS: u32 = 0x0000_2400;
+pub const VMCS_GUEST_LINEAR_ADDRESS: u32 = 0x0000_640A;
+pub const VMCS_GUEST_VMX_PREEMPTION_TIMER: u32 = 0x0000_482E;
+/// IA32 性能/监控相关，供时序/卸载路径对齐 C++ 参考。
+pub const IA32_VMX_MISC: u32 = 0x485;
+pub const IA32_PERF_GLOBAL_CTRL: u32 = 0x38F;
+pub const IA32_XSS: u32 = 0xDA0;
 
 pub const VMX_BASIC_TRUE_CTLS: u64 = 1 << 55;
 

@@ -3,15 +3,19 @@
 use core::mem::size_of;
 
 use wdk_sys::ntddk::{
-    ExAllocatePool2, ExFreePoolWithTag, KeQueryActiveProcessorCountEx, KeRevertToUserAffinityThreadEx,
-    KeSetSystemAffinityThreadEx,
+    ExAllocatePool2, ExFreePoolWithTag, KeGetCurrentProcessorNumberEx, KeQueryActiveProcessorCountEx,
+    KeRevertToUserAffinityThreadEx, KeSetSystemAffinityThreadEx,
 };
+use wdk_sys::PROCESSOR_NUMBER;
 use wdk_sys::{NTSTATUS, POOL_FLAG_NON_PAGED, SIZE_T, ULONG};
 
 use crate::arch::{self, VmxFixedMsrs};
 use crate::ept::EptState;
 use crate::exit_handlers;
+use crate::guest_context::GuestRegs;
+use crate::ia32;
 use crate::logger;
+use crate::msr_bitmap;
 use crate::mm::{self, free_contiguous_page};
 use crate::vmcs;
 use crate::vmexit;
@@ -19,7 +23,51 @@ use crate::vmx;
 
 const POOL_TAG: ULONG = u32::from_ne_bytes(*b"HvVc");
 
+
+fn fill_vcpu_cache(cpu: &mut PerCpuState) {
+    let feature_control = unsafe { arch::rdmsr(ia32::IA32_FEATURE_CONTROL) };
+    let mut g = feature_control;
+    g |= 1;
+    g &= !(1u64 << 1);
+    g &= !(1u64 << 2);
+    let vmx_misc = unsafe { arch::rdmsr(ia32::IA32_VMX_MISC) };
+    let d = arch::cpuid(0x0D, 0x00);
+    let xmask = !(((d.edx as u64) << 32) | (d.eax as u64));
+    cpu.cache.feature_control = feature_control;
+    cpu.cache.guest_feature_control = g;
+    cpu.cache.xcr0_unsupported_mask = xmask;
+    cpu.cache.vmx_misc = vmx_misc;
+}
+
 /// 最小 64 位 guest：`xor rax,rax` → `vmcall` → `jmp $`。
+/// 与 `hv/hv/vcpu.cpp` 中 `cache_cpu_data` / `vcpu_cached_data` 对齐的可见字段子集。
+#[derive(Clone, Copy, Debug)]
+pub struct VcpuCache {
+    pub feature_control: u64,
+    pub guest_feature_control: u64,
+    pub xcr0_unsupported_mask: u64,
+    pub vmx_misc: u64,
+    pub tsc_offset: u64,
+    pub preemption_timer: u64,
+    pub hide_vm_exit_overhead: bool,
+    pub vm_exit_tsc_overhead: u64,
+}
+
+impl VcpuCache {
+    pub const fn empty() -> Self {
+        Self {
+            feature_control: 0,
+            guest_feature_control: 0,
+            xcr0_unsupported_mask: !0u64,
+            vmx_misc: 0,
+            tsc_offset: 0,
+            preemption_timer: !0u64,
+            hide_vm_exit_overhead: false,
+            vm_exit_tsc_overhead: 0,
+        }
+    }
+}
+
 const GUEST_STUB_CODE: [u8; 8] = [
     0x48, 0x31, 0xc0, // xor rax, rax
     0x0f, 0x01, 0xc1, // vmcall
@@ -37,6 +85,8 @@ pub struct PerCpuState {
     pub host_stack_page: *mut u8,
     pub guest_stub_page: *mut u8,
     pub ept: Option<EptState>,
+    /// 与参考 `cache_cpu_data` 对齐的只读/伪造 MSR 缓存。
+    pub cache: VcpuCache,
     /// 已成功执行 `VMXON`。
     pub vmxon_done: bool,
 }
@@ -53,6 +103,7 @@ impl PerCpuState {
             host_stack_page: core::ptr::null_mut(),
             guest_stub_page: core::ptr::null_mut(),
             ept: None,
+            cache: VcpuCache::empty(),
             vmxon_done: false,
         }
     }
@@ -89,6 +140,17 @@ pub struct VmxCluster {
 impl VmxCluster {
     pub fn is_active(&self) -> bool {
         self.active
+    }
+
+    /// 当前已亲和到的逻辑处理器的 `PerCpuState`（VM-exit 处理路径用于读 `VcpuCache`、EPT）。
+    pub fn current_cpu_mut(&mut self) -> Option<&mut PerCpuState> {
+        let mut pn: PROCESSOR_NUMBER = unsafe { core::mem::zeroed() };
+        let i = unsafe { KeGetCurrentProcessorNumberEx(&mut pn) } as u32;
+        if i < self.count {
+            Some(unsafe { &mut *self.cpus.add(i as usize) })
+        } else {
+            None
+        }
     }
 
     /// 在组 0 的每个逻辑处理器上执行 `VMXON` + `VMCLEAR`/`VMPTRLD`。
@@ -190,7 +252,7 @@ impl VmxCluster {
         unsafe {
             vmcs::prepare_vmxon_region(vmxon);
             vmcs::prepare_vmcs_region(vmcs);
-            core::ptr::write_bytes(msr_bitmap, 0xFF, 4096);
+            msr_bitmap::prepare_msr_bitmap_page(msr_bitmap);
             core::ptr::write_bytes(host_stack, 0xCC, 4096);
             core::ptr::copy_nonoverlapping(GUEST_STUB_CODE.as_ptr(), guest_stub, GUEST_STUB_CODE.len());
         }
@@ -302,6 +364,8 @@ impl VmxCluster {
             return wdk_sys::STATUS_UNSUCCESSFUL;
         }
 
+        fill_vcpu_cache(cpu);
+
         if let Err(err) = unsafe { vmcs::configure_guest_state() } {
             logger::log_vmcs_error("configure_guest_state", vmcs::VmcsField::GUEST_CR3, err);
             let _ = unsafe { vmx::vmxoff() };
@@ -373,14 +437,25 @@ impl VmxCluster {
             Ok(reason) => {
                 logger::log_vm_exit_reason(reason.basic, reason.raw);
                 exit_handlers::log_basic_exit(reason.basic as u32);
-                let ctx = exit_handlers::VmExitContext {
-                    reason,
-                    guest_rip: 0,
-                    guest_rsp: 0,
-                    guest_rflags,
+                let mut regs = GuestRegs {
+                    r15: 0,
+                    r14: 0,
+                    r13: 0,
+                    r12: 0,
+                    r11: 0,
+                    r10: 0,
+                    r9: 0,
+                    r8: 0,
+                    rdi: 0,
+                    rsi: 0,
+                    rbp: 0,
+                    rbx: 0,
+                    rdx: 0,
+                    rcx: 0,
+                    rax: 0,
                 };
                 if let Some(opt) = peek_session_for_dispatch() {
-                    let _ = exit_handlers::dispatch_vm_exit(opt, &ctx, 0, [0; 6]);
+                    exit_handlers::dispatch_vm_exit(opt, &mut regs, &reason, 0, 0);
                 }
             }
             Err(err) => {

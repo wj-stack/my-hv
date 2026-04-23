@@ -55,6 +55,11 @@ pub fn read_cr3() -> u64 {
     v
 }
 
+/// 写 `CR3`（仅在离开 VMX 前从 guest 视图恢复，参考 `handle_vm_exit` 卸载块）。
+pub unsafe fn write_cr3(v: u64) {
+    unsafe { core::arch::asm!("mov cr3, {}", in(reg) v) };
+}
+
 pub fn read_cr4() -> u64 {
     let v: u64;
     // SAFETY: no preconditions.
@@ -129,6 +134,22 @@ pub struct VmxFixedMsrs {
     pub vmx_cr0_fixed1: u64,
     pub vmx_cr4_fixed0: u64,
     pub vmx_cr4_fixed1: u64,
+}
+
+/// `RDTSCP`：返回 EAX、EDX、ECX（Aux）。
+pub fn read_rdtscp() -> (u32, u32, u32) {
+    let eax: u32;
+    let edx: u32;
+    let ecx: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdtscp",
+            out("eax") eax,
+            out("edx") edx,
+            out("ecx") ecx,
+        );
+    }
+    (eax, edx, ecx)
 }
 
 impl VmxFixedMsrs {

@@ -1,4 +1,4 @@
-//! WDM 驱动：设备对象、符号链接、IOCTL（模板 ping/echo + HV START/STOP + 超级调用）。
+//! WDM 驱动：设备对象、符号链接、IOCTL（模板 ping/echo + HV STOP/超级调用；与 C++ `hv` 一致在 DriverEntry 自动 START）。
 //! 设备名字符串必须与 `shared_contract::DEVICE_BASENAME` 一致。
 
 #![no_std]
@@ -19,8 +19,9 @@ use wdk_sys::ntddk::{
 };
 use wdk_sys::{
     CCHAR, DEVICE_OBJECT, DRIVER_OBJECT, IO_NO_INCREMENT, IRP, KGUARDED_MUTEX, NTSTATUS,
-    PCUNICODE_STRING, STATUS_ALREADY_INITIALIZED, STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_DEVICE_REQUEST,
-    STATUS_INVALID_PARAMETER, STATUS_SUCCESS, STATUS_UNSUCCESSFUL, UNICODE_STRING,
+    PCUNICODE_STRING, STATUS_ALREADY_INITIALIZED, STATUS_BUFFER_TOO_SMALL, STATUS_HV_OPERATION_FAILED,
+    STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER, STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
+    UNICODE_STRING,
 };
 
 #[cfg(not(test))]
@@ -29,7 +30,11 @@ static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
 mod arch;
 mod ept;
+mod exception_inject;
+mod guest_context;
 mod exit_handlers;
+mod mtrr;
+mod msr_bitmap;
 mod gdt;
 mod hypercalls;
 mod ia32;
@@ -105,6 +110,29 @@ unsafe fn with_session<R>(f: impl FnOnce(&mut Option<VmxCluster>) -> R) -> R {
     }
 }
 
+/// 与 `hv::main.cpp` 中 `hv::start()` 同序：`install_vmexit_session` 后 `VmxCluster::start()`。
+unsafe fn hv_try_start() -> NTSTATUS {
+    crate::vmexit::install_vmexit_session(SESSION.0.get());
+    let status = unsafe {
+        with_session(|session| {
+            if session.is_some() {
+                return STATUS_ALREADY_INITIALIZED;
+            }
+            match VmxCluster::start() {
+                Ok(c) => {
+                    *session = Some(c);
+                    STATUS_SUCCESS
+                }
+                Err(e) => e,
+            }
+        })
+    };
+    if status != STATUS_SUCCESS && status != STATUS_ALREADY_INITIALIZED {
+        crate::vmexit::clear_vmexit_session();
+    }
+    status
+}
+
 unsafe extern "C" fn dispatch_create_close(
     _device_object: *mut DEVICE_OBJECT,
     irp: *mut IRP,
@@ -162,21 +190,7 @@ unsafe extern "C" fn dispatch_device_control(
             unsafe { complete_request(irp, STATUS_SUCCESS, input_len) }
         }
         IOCTL_HV_START => {
-            crate::vmexit::install_vmexit_session(SESSION.0.get());
-            let status = unsafe {
-                with_session(|session| {
-                    if session.is_some() {
-                        return STATUS_ALREADY_INITIALIZED;
-                    }
-                    match VmxCluster::start() {
-                        Ok(c) => {
-                            *session = Some(c);
-                            STATUS_SUCCESS
-                        }
-                        Err(e) => e,
-                    }
-                })
-            };
+            let status = unsafe { hv_try_start() };
             unsafe { complete_request(irp, status, 0) }
         }
         IOCTL_HV_STOP => {
@@ -311,6 +325,19 @@ pub unsafe extern "system" fn driver_entry(
             wdk_sys::ntddk::IoDeleteDevice(device_object);
         }
         return status;
+    }
+
+    let hv_status = unsafe { hv_try_start() };
+    if !wdk::nt_success(hv_status) {
+        unsafe {
+            let _ = wdk_sys::ntddk::IoDeleteSymbolicLink(&raw mut symlink_name);
+            wdk_sys::ntddk::IoDeleteDevice(device_object);
+        }
+        println!(
+            "{}: virtualization failed (status {hv_status:#x}), driver not loaded",
+            "my-hv-driver"
+        );
+        return STATUS_HV_OPERATION_FAILED;
     }
 
     println!(
