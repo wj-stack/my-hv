@@ -39,6 +39,7 @@ mod gdt;
 mod hypercalls;
 mod ia32;
 mod idt;
+mod offset_table;
 mod introspection;
 mod logger;
 mod mm;

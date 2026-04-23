@@ -1,6 +1,7 @@
 //! 每逻辑处理器的 VMXON/VMCS 生命周期。对应 `hv/hv/vcpu.cpp`、`hv/hv/vcpu.h` 中的 `virtualize_cpu` / `stop` 路径。
 
 use alloc::boxed::Box;
+use alloc::format;
 
 use core::mem::size_of;
 
@@ -19,7 +20,7 @@ unsafe extern "system" {
 use crate::arch::{self, VmxFixedMsrs};
 use crate::ept::EptState;
 use crate::host_descriptor::{self, HostTaskState};
-use crate::host_page_tables::HostPageTables;
+use crate::host_page_tables::{HostPageTables, HostPageTablesBox};
 use crate::ia32;
 use crate::logger;
 use crate::msr_bitmap;
@@ -156,7 +157,7 @@ pub struct VmxCluster {
     /// 所有 CPU 均完成 `VMXON`。
     active: bool,
     /// 与 `ghv.host_page_tables` 一致：全 VCPU 共享 host CR3 页表。
-    host_page_tables: Option<Box<HostPageTables>>,
+    host_page_tables: Option<HostPageTablesBox>,
 }
 
 impl VmxCluster {
@@ -180,23 +181,28 @@ impl VmxCluster {
     /// # Safety
     /// 调用方必须处于 `IRQL <= APC_LEVEL`（与 `KeSetSystemAffinityThreadEx` 要求一致）。
     pub unsafe fn start() -> Result<Self, NTSTATUS> {
+        logger::log("VmxCluster::start: Checking if VMX root is supported by platform...");
         if !vmx::host_supports_vmx_root() {
-            logger::log("VMX root not supported by platform");
+            logger::log("VmxCluster::start: VMX root not supported by platform. Aborting setup.");
             return Err(wdk_sys::STATUS_NOT_SUPPORTED);
         }
 
+        logger::log("VmxCluster::start: Probing kernel structure offsets (calling introspection::find_offsets)...");
         if !unsafe { introspection::find_offsets() } {
-            logger::log("find_offsets failed (Ps* opcode probe)");
+            logger::log("VmxCluster::start: Failed to determine offsets via introspection::find_offsets (Ps* opcode probe). Aborting setup.");
             return Err(wdk_sys::STATUS_UNSUCCESSFUL);
         }
 
+        logger::log("VmxCluster::start: Querying active processor count...");
         let count = unsafe { KeQueryActiveProcessorCount(core::ptr::null_mut()) } as u32;
+        logger::log(&format!("VmxCluster::start: Active processor count detected: {}", count));
         if count == 0 {
-            logger::log("no active processors");
+            logger::log("VmxCluster::start: No active processors found. Aborting setup.");
             return Err(wdk_sys::STATUS_UNSUCCESSFUL);
         }
 
         let bytes = (count as usize).saturating_mul(size_of::<PerCpuState>());
+        logger::log(&format!("VmxCluster::start: Allocating {} bytes for {} PerCpuState(s)...", bytes, count));
         let cpus = unsafe {
             ExAllocatePool2(
                 POOL_FLAG_NON_PAGED,
@@ -205,12 +211,13 @@ impl VmxCluster {
             )
         } as *mut PerCpuState;
         if cpus.is_null() {
-            logger::log("failed to allocate per-cpu VMX state array");
+            logger::log("VmxCluster::start: Failed to allocate per-CPU VMX state array (ExAllocatePool2 returned null).");
             return Err(wdk_sys::STATUS_INSUFFICIENT_RESOURCES);
         }
         unsafe {
             core::ptr::write_bytes(cpus, 0, count as usize);
         }
+        logger::log("VmxCluster::start: Per-CPU VMX state array allocated and zeroed.");
 
         let mut cluster = VmxCluster {
             cpus,
@@ -220,28 +227,48 @@ impl VmxCluster {
         };
 
         let system_cr3 = introspection::system_cr3().unwrap_or_else(arch::read_cr3);
+        logger::log(&format!(
+            "VmxCluster::start: Detected system CR3 value: 0x{:x}. Preparing host page tables...",
+            system_cr3
+        ));
+
+
         let Some(host_pt) = HostPageTables::prepare(system_cr3) else {
-            logger::log("prepare HostPageTables failed");
+            logger::log("VmxCluster::start: Failed to prepare HostPageTables. Freeing per-CPU VMX state array.");
             unsafe { ExFreePoolWithTag(cpus.cast(), POOL_TAG) };
             return Err(wdk_sys::STATUS_INSUFFICIENT_RESOURCES);
         };
 
+        logger::log("VmxCluster::start: HostPageTables successfully prepared.");
+        
+        logger::log(&format!(
+            "VmxCluster::start: host VMCS CR3 candidate=0x{:x}; pml4[255]=0x{:x} pml4[256]=0x{:x} pml4[511]=0x{:x}",
+            host_pt.cr3_value(),
+            host_pt.pml4[255],
+            host_pt.pml4[256],
+            host_pt.pml4[511],
+        ));
+
         for i in 0..count {
             let affinity: u64 = 1u64 << i;
+            logger::log(&format!("VmxCluster::start: Setting affinity to logical processor {}...", i));
             let prev = unsafe { KeSetSystemAffinityThreadEx(affinity) };
+            logger::log(&format!("VmxCluster::start: Initializing VMX state on processor {}...", i));
             let st = unsafe { cluster.init_cpu(i, &host_pt) };
             unsafe { KeRevertToUserAffinityThreadEx(prev) };
             if !wdk::nt_success(st) {
-                logger::log("VMX init failed on a CPU, starting rollback");
+                logger::log(&format!("VmxCluster::start: VMX init failed on logical processor {} with NTSTATUS=0x{:x}. Starting rollback.", i, st));
                 unsafe { cluster.rollback_partial(i) };
                 unsafe { ExFreePoolWithTag(cpus.cast(), POOL_TAG) };
                 drop(host_pt);
                 return Err(st);
             }
+            logger::log(&format!("VmxCluster::start: Successfully initialized VMX state on logical processor {}.", i));
         }
 
         cluster.host_page_tables = Some(host_pt);
         cluster.active = true;
+        logger::log("VmxCluster::start: All logical processors initialized and VMXON complete. VmxCluster is now active.");
         Ok(cluster)
     }
 
