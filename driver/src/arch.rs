@@ -57,7 +57,13 @@ pub fn read_cr3() -> u64 {
 
 /// 写 `CR3`（仅在离开 VMX 前从 guest 视图恢复，参考 `handle_vm_exit` 卸载块）。
 pub unsafe fn write_cr3(v: u64) {
-    unsafe { core::arch::asm!("mov cr3, {}", in(reg) v) };
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, rax",
+            in("rax") v,
+            options(nostack, nomem),
+        );
+    };
 }
 
 pub fn read_cr4() -> u64 {
@@ -90,12 +96,25 @@ pub fn read_fsbase() -> u64 {
     unsafe { rdmsr(ia32::IA32_FS_BASE) }
 }
 
+/// 使用固定 `rax`，避免 Windows x64 上 `in(reg)` 与 `mov cr0, rcx` 类编码在 LLVM 内联汇编里与 ABI 交织出错（曾出现 `rcx==0` 仍执行 `mov cr0` 的蓝屏）。
 pub unsafe fn write_cr0(v: u64) {
-    unsafe { core::arch::asm!("mov cr0, {}", in(reg) v) };
+    unsafe {
+        core::arch::asm!(
+            "mov cr0, rax",
+            in("rax") v,
+            options(nostack, nomem),
+        );
+    };
 }
 
 pub unsafe fn write_cr4(v: u64) {
-    unsafe { core::arch::asm!("mov cr4, {}", in(reg) v) };
+    unsafe {
+        core::arch::asm!(
+            "mov cr4, rax",
+            in("rax") v,
+            options(nostack, nomem),
+        );
+    };
 }
 
 const CR4_VMXE: u64 = 1 << 13;
@@ -127,6 +146,8 @@ pub fn is_long_mode() -> bool {
 }
 
 /// Enable CR4.VMXE after fixing CR0/CR4 against IA32_VMX_{CR0,CR4}_FIXED* (see Intel SDM 3.23.6–8).
+///
+/// 与 `hv/vcpu.cpp::enable_vmx_operation` 一致：在改写 `CR0`/`CR4` 期间关中断，避免在更新过程中被抢占。
 pub unsafe fn enable_vmx_in_hardware(cached: &VmxFixedMsrs) -> bool {
     if !has_vmx_in_cpuid() {
         return false;
@@ -137,6 +158,15 @@ pub unsafe fn enable_vmx_in_hardware(cached: &VmxFixedMsrs) -> bool {
     if !feature_control_allows_vmx() {
         return false;
     }
+    if !cached.fixed_pairs_valid() {
+        return false;
+    }
+
+    let rflags = read_rflags();
+    let if_was_set = (rflags & (1u64 << 9)) != 0;
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack));
+    }
 
     let mut cr0 = read_cr0();
     let mut cr4 = read_cr4();
@@ -145,9 +175,25 @@ pub unsafe fn enable_vmx_in_hardware(cached: &VmxFixedMsrs) -> bool {
     cr4 |= CR4_VMXE;
     cr4 |= cached.vmx_cr4_fixed0;
     cr4 &= cached.vmx_cr4_fixed1;
+
+    if cr0 == 0 || cr4 == 0 || (cr4 & CR4_VMXE) == 0 {
+        if if_was_set {
+            unsafe {
+                core::arch::asm!("sti", options(nomem, nostack));
+            }
+        }
+        return false;
+    }
+
     unsafe {
         write_cr0(cr0);
         write_cr4(cr4);
+    }
+
+    if if_was_set {
+        unsafe {
+            core::arch::asm!("sti", options(nomem, nostack));
+        }
     }
     true
 }
@@ -176,17 +222,36 @@ pub fn read_rdtscp() -> (u32, u32, u32) {
 }
 
 impl VmxFixedMsrs {
+    /// Intel SDM：`FIXED0` 中为 1 的位在 `FIXED1` 中必须为 1，否则不存在合法 `CR0`/`CR4`。
+    pub fn fixed_pairs_valid(&self) -> bool {
+        if self.vmx_cr0_fixed1 == 0 || self.vmx_cr4_fixed1 == 0 {
+            return false;
+        }
+        if (self.vmx_cr0_fixed0 & !self.vmx_cr0_fixed1) != 0 {
+            return false;
+        }
+        if (self.vmx_cr4_fixed0 & !self.vmx_cr4_fixed1) != 0 {
+            return false;
+        }
+        let cr4_vmx = (CR4_VMXE | self.vmx_cr4_fixed0) & self.vmx_cr4_fixed1;
+        (cr4_vmx & CR4_VMXE) != 0
+    }
+
     /// Pull fixed-0/1 values after VMX is available in CPUID. Mirrors `cache_cpu_data` in `hv/hv/vcpu.cpp`.
     pub fn read() -> Option<Self> {
         if !has_vmx_in_cpuid() {
             return None;
         }
         // SAFETY: well-known MSRs when VMX present
-        Some(Self {
+        let s = Self {
             vmx_cr0_fixed0: unsafe { rdmsr(ia32::IA32_VMX_CR0_FIXED0) },
             vmx_cr0_fixed1: unsafe { rdmsr(ia32::IA32_VMX_CR0_FIXED1) },
             vmx_cr4_fixed0: unsafe { rdmsr(ia32::IA32_VMX_CR4_FIXED0) },
             vmx_cr4_fixed1: unsafe { rdmsr(ia32::IA32_VMX_CR4_FIXED1) },
-        })
+        };
+        if !s.fixed_pairs_valid() {
+            return None;
+        }
+        Some(s)
     }
 }

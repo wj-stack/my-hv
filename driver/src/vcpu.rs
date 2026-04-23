@@ -1,6 +1,5 @@
 //! 每逻辑处理器的 VMXON/VMCS 生命周期。对应 `hv/hv/vcpu.cpp`、`hv/hv/vcpu.h` 中的 `virtualize_cpu` / `stop` 路径。
 
-use alloc::boxed::Box;
 use alloc::format;
 
 use core::mem::size_of;
@@ -25,7 +24,7 @@ use crate::ia32;
 use crate::logger;
 use crate::msr_bitmap;
 use crate::introspection;
-use crate::mm::{self, free_contiguous_page};
+use crate::mm::{self, free_contiguous, free_contiguous_page};
 use crate::vmcs;
 use crate::vmexit;
 use crate::vm_launch;
@@ -36,6 +35,11 @@ const POOL_TAG: ULONG = u32::from_ne_bytes(*b"HvVc");
 
 /// 与 `hv/hv/vcpu.h` 中 `guest_vpid` 一致。
 const GUEST_VPID: u16 = 1;
+/// `hv/vcpu.h::host_stack_size`（VM-exit 用 host 栈，6×4KiB）。
+const HOST_STACK_SIZE: usize = 0x6000;
+const HOST_STACK_PAGES: usize = HOST_STACK_SIZE / 4096;
+/// `vcpu` 内 `host_gdt` / `host_tss` 均为 `alignas(0x1000)`，等价于连续两页（第一页仅 GDT，第二页仅 TSS）。
+const HOST_GDT_TSS_PAGES: usize = 2;
 
 
 fn fill_vcpu_cache(cpu: &mut PerCpuState) {
@@ -130,10 +134,10 @@ impl PerCpuState {
             free_contiguous_page(self.vmxon_page);
             free_contiguous_page(self.vmcs_page);
             free_contiguous_page(self.msr_bitmap_page);
-            free_contiguous_page(self.host_stack_page);
+            free_contiguous(self.host_stack_page);
             free_contiguous_page(self.msr_auto_page);
             free_contiguous_page(self.host_idt_page);
-            free_contiguous_page(self.host_gdt_tss_page);
+            free_contiguous(self.host_gdt_tss_page);
         }
         if let Some(mut ept) = self.ept.take() {
             unsafe { ept.release() };
@@ -272,6 +276,29 @@ impl VmxCluster {
         Ok(cluster)
     }
 
+    /// `virtualize_cpu` 失败时尚未写入 `PerCpuState` 的局部分配释放（与 `hv` 多页 host 栈 / 分离 GDT+TSS 页一致）。
+    unsafe fn free_init_cpu_locals(
+        vmxon: *mut u8,
+        vmcs: *mut u8,
+        msr_bitmap: *mut u8,
+        host_stack: *mut u8,
+        msr_auto: *mut u8,
+        host_idt: *mut u8,
+        host_gdt_tss: *mut u8,
+    ) {
+        unsafe {
+            free_contiguous_page(vmxon);
+            free_contiguous_page(vmcs);
+            free_contiguous_page(msr_bitmap);
+            free_contiguous(host_stack);
+            free_contiguous_page(msr_auto);
+            free_contiguous_page(host_idt);
+            free_contiguous(host_gdt_tss);
+        }
+    }
+
+    /// 与 `hv/vcpu.cpp::virtualize_cpu` 同序：`cache_cpu_data` → `enable_vmx_operation` → `enter_vmx_operation` →
+    /// `load_vmcs_pointer` → `prepare_external_structures` → 写 VMCS → `vm_launch`。
     unsafe fn init_cpu(&mut self, index: u32, host_pt: &HostPageTables) -> NTSTATUS {
         let cpu = unsafe { &mut *self.cpus.add(index as usize) };
         *cpu = PerCpuState::empty();
@@ -293,8 +320,8 @@ impl VmxCluster {
             }
             return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
         };
-        let Some(host_stack) = (unsafe { mm::alloc_contiguous_page() }) else {
-            logger::log("failed to allocate host VM-exit stack page");
+        let Some(host_stack) = (unsafe { mm::alloc_contiguous_pages(HOST_STACK_PAGES) }) else {
+            logger::log("failed to allocate host VM-exit stack");
             unsafe {
                 free_contiguous_page(vmxon);
                 free_contiguous_page(vmcs);
@@ -305,67 +332,41 @@ impl VmxCluster {
         let Some(msr_auto) = (unsafe { mm::alloc_contiguous_page() }) else {
             logger::log("failed to allocate MSR auto-load/store page");
             unsafe {
-                free_contiguous_page(vmxon);
-                free_contiguous_page(vmcs);
-                free_contiguous_page(msr_bitmap);
-                free_contiguous_page(host_stack);
+                Self::free_init_cpu_locals(vmxon, vmcs, msr_bitmap, host_stack, core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut());
             }
             return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
         };
         let Some(host_idt) = (unsafe { mm::alloc_contiguous_page() }) else {
             logger::log("failed to allocate host IDT page");
             unsafe {
-                free_contiguous_page(vmxon);
-                free_contiguous_page(vmcs);
-                free_contiguous_page(msr_bitmap);
-                free_contiguous_page(host_stack);
-                free_contiguous_page(msr_auto);
+                Self::free_init_cpu_locals(vmxon, vmcs, msr_bitmap, host_stack, msr_auto, core::ptr::null_mut(), core::ptr::null_mut());
             }
             return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
         };
-        let Some(host_gdt_tss) = (unsafe { mm::alloc_contiguous_page() }) else {
-            logger::log("failed to allocate host GDT/TSS page");
+        let Some(host_gdt_tss) = (unsafe { mm::alloc_contiguous_pages(HOST_GDT_TSS_PAGES) }) else {
+            logger::log("failed to allocate host GDT + TSS pages");
             unsafe {
-                free_contiguous_page(vmxon);
-                free_contiguous_page(vmcs);
-                free_contiguous_page(msr_bitmap);
-                free_contiguous_page(host_stack);
-                free_contiguous_page(msr_auto);
-                free_contiguous_page(host_idt);
+                Self::free_init_cpu_locals(vmxon, vmcs, msr_bitmap, host_stack, msr_auto, host_idt, core::ptr::null_mut());
             }
             return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
         };
 
-        // 在 `VMXON` / `VMCLEAR` 之前初始化各 4KiB 控制结构。对照 `hv/hv/vcpu.cpp` 的 `virtualize_cpu`：
-        // - `prepare_vmxon_region` ≈ `enter_vmx_operation()` 里对 `vmxon_region.revision_id` / `must_be_zero` 的填写；
-        // - `prepare_vmcs_region` ≈ `load_vmcs_pointer()` 里对 `vmcs_region.revision_id` / `shadow_vmcs_indicator` 的填写；
-        // - `prepare_msr_bitmap_page` ≈ `prepare_external_structures()` 里 `memset(msr_bitmap)` + FEATURE_CONTROL 读退出 + `enable_mtrr_exiting`。
+        let host_gdt = host_gdt_tss;
+        let tss = unsafe { host_gdt_tss.add(4096).cast::<HostTaskState>() };
+
+        // `enter_vmx_operation` / `load_vmcs_pointer`：仅填 revision（与 C++ 在 VMXON/VMPTRLD 前写头一致）。
         unsafe {
-            // 写入 IA32_VMX_BASIC 中的 VMCS revision id，满足 Intel SDM 对 VMXON 区域的要求。
             vmcs::prepare_vmxon_region(vmxon);
-            // 同上，供后续 VMCLEAR/VMPTRLD 使用的 VMCS 区域头。
             vmcs::prepare_vmcs_region(vmcs);
-            // 整页 MSR 位图：默认不拦截；对 FEATURE_CONTROL 读与 MTRR 相关写置位以在 guest 访问时 VM-exit。
-            msr_bitmap::prepare_msr_bitmap_page(msr_bitmap);
-            // 与 `hv` 一致：`host_stack` 清零。
-            core::ptr::write_bytes(host_stack, 0, 4096);
-            vmcs::prepare_msr_auto_lists(msr_auto);
-            let tss = host_gdt_tss.add(0x80).cast::<HostTaskState>();
-            core::ptr::write_bytes(tss, 0, size_of::<HostTaskState>());
-            host_descriptor::prepare_host_idt(host_idt);
-            host_descriptor::prepare_host_gdt(host_gdt_tss, tss);
         }
+
+        // `cache_cpu_data`
+        fill_vcpu_cache(cpu);
 
         let Some(fixed) = VmxFixedMsrs::read() else {
             logger::log("failed to read VMX fixed MSRs");
             unsafe {
-                free_contiguous_page(vmxon);
-                free_contiguous_page(vmcs);
-                free_contiguous_page(msr_bitmap);
-                free_contiguous_page(host_stack);
-                free_contiguous_page(msr_auto);
-                free_contiguous_page(host_idt);
-                free_contiguous_page(host_gdt_tss);
+                Self::free_init_cpu_locals(vmxon, vmcs, msr_bitmap, host_stack, msr_auto, host_idt, host_gdt_tss);
             }
             return wdk_sys::STATUS_NOT_SUPPORTED;
         };
@@ -373,22 +374,74 @@ impl VmxCluster {
         if !unsafe { arch::enable_vmx_in_hardware(&fixed) } {
             logger::log("enable_vmx_in_hardware returned false");
             unsafe {
-                free_contiguous_page(vmxon);
-                free_contiguous_page(vmcs);
-                free_contiguous_page(msr_bitmap);
-                free_contiguous_page(host_stack);
-                free_contiguous_page(msr_auto);
-                free_contiguous_page(host_idt);
-                free_contiguous_page(host_gdt_tss);
+                Self::free_init_cpu_locals(vmxon, vmcs, msr_bitmap, host_stack, msr_auto, host_idt, host_gdt_tss);
             }
             return wdk_sys::STATUS_NOT_SUPPORTED;
         }
 
         let vmxon_phys = unsafe { mm::physical_address(vmxon) };
         let vmcs_phys = unsafe { mm::physical_address(vmcs) };
-        let msr_bitmap_phys = unsafe { mm::physical_address(msr_bitmap) };
-        let ept = unsafe { EptState::build_identity_skeleton() };
 
+        if !unsafe { vmx::vmxon(&raw const vmxon_phys) } {
+            logger::log("VMXON failed");
+            unsafe {
+                arch::disable_vmx_hardware();
+                Self::free_init_cpu_locals(vmxon, vmcs, msr_bitmap, host_stack, msr_auto, host_idt, host_gdt_tss);
+            }
+            return wdk_sys::STATUS_UNSUCCESSFUL;
+        }
+
+        if !unsafe { vmx::invept_all_contexts() } {
+            logger::log("INVEPT(all-context) after VMXON failed");
+            let _ = unsafe { vmx::vmxoff() };
+            unsafe {
+                arch::disable_vmx_hardware();
+                Self::free_init_cpu_locals(vmxon, vmcs, msr_bitmap, host_stack, msr_auto, host_idt, host_gdt_tss);
+            }
+            return wdk_sys::STATUS_UNSUCCESSFUL;
+        }
+
+        if !unsafe { vmx::vmclear(&raw const vmcs_phys) } {
+            logger::log("VMCLEAR failed");
+            let _ = unsafe { vmx::vmxoff() };
+            unsafe {
+                arch::disable_vmx_hardware();
+                Self::free_init_cpu_locals(vmxon, vmcs, msr_bitmap, host_stack, msr_auto, host_idt, host_gdt_tss);
+            }
+            return wdk_sys::STATUS_UNSUCCESSFUL;
+        }
+
+        if !unsafe { vmx::vmptrld(&raw const vmcs_phys) } {
+            logger::log("VMPTRLD failed");
+            let _ = unsafe { vmx::vmxoff() };
+            unsafe {
+                arch::disable_vmx_hardware();
+                Self::free_init_cpu_locals(vmxon, vmcs, msr_bitmap, host_stack, msr_auto, host_idt, host_gdt_tss);
+            }
+            return wdk_sys::STATUS_UNSUCCESSFUL;
+        }
+
+        // `prepare_external_structures`：须在 `load_vmcs_pointer` 之后（与 `vcpu.cpp` 顺序一致）。
+        unsafe {
+            msr_bitmap::prepare_msr_bitmap_page(msr_bitmap);
+            core::ptr::write_bytes(host_stack, 0, HOST_STACK_SIZE);
+            vmcs::prepare_msr_auto_lists(msr_auto);
+            core::ptr::write_bytes(tss.cast::<u8>(), 0, size_of::<HostTaskState>());
+            host_descriptor::prepare_host_idt(host_idt);
+            host_descriptor::prepare_host_gdt(host_gdt, tss.cast_const());
+        }
+
+        let Some(ept) = (unsafe { EptState::build_identity_skeleton() }) else {
+            logger::log("EPT build_identity_skeleton failed");
+            let _ = unsafe { vmx::vmxoff() };
+            unsafe {
+                arch::disable_vmx_hardware();
+                Self::free_init_cpu_locals(vmxon, vmcs, msr_bitmap, host_stack, msr_auto, host_idt, host_gdt_tss);
+            }
+            return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
+        };
+
+        let msr_bitmap_phys = unsafe { mm::physical_address(msr_bitmap) };
         cpu.vmxon_page = vmxon;
         cpu.vmcs_page = vmcs;
         cpu.vmxon_phys = vmxon_phys;
@@ -399,47 +452,7 @@ impl VmxCluster {
         cpu.msr_auto_page = msr_auto;
         cpu.host_idt_page = host_idt;
         cpu.host_gdt_tss_page = host_gdt_tss;
-        cpu.ept = ept;
-
-        if !unsafe { vmx::vmxon(&raw const cpu.vmxon_phys) } {
-            logger::log("VMXON failed");
-            unsafe {
-                arch::disable_vmx_hardware();
-                cpu.free_pages();
-            }
-            return wdk_sys::STATUS_UNSUCCESSFUL;
-        }
-
-        // `hv/vcpu.cpp::enter_vmx_operation`：`VMXON` 后 `invept` 全局失效。
-        if !unsafe { vmx::invept_all_contexts() } {
-            logger::log("INVEPT(all-context) after VMXON failed");
-            let _ = unsafe { vmx::vmxoff() };
-            unsafe {
-                arch::disable_vmx_hardware();
-                cpu.free_pages();
-            }
-            return wdk_sys::STATUS_UNSUCCESSFUL;
-        }
-
-        if !unsafe { vmx::vmclear(&raw const cpu.vmcs_phys) } {
-            logger::log("VMCLEAR failed");
-            let _ = unsafe { vmx::vmxoff() };
-            unsafe {
-                arch::disable_vmx_hardware();
-                cpu.free_pages();
-            }
-            return wdk_sys::STATUS_UNSUCCESSFUL;
-        }
-
-        if !unsafe { vmx::vmptrld(&raw const cpu.vmcs_phys) } {
-            logger::log("VMPTRLD failed");
-            let _ = unsafe { vmx::vmxoff() };
-            unsafe {
-                arch::disable_vmx_hardware();
-                cpu.free_pages();
-            }
-            return wdk_sys::STATUS_UNSUCCESSFUL;
-        }
+        cpu.ept = Some(ept);
 
         let msr_auto_phys = unsafe { mm::physical_address(msr_auto) };
         let system_cr3 = introspection::system_cr3().unwrap_or_else(arch::read_cr3);
@@ -473,16 +486,17 @@ impl VmxCluster {
             }
         }
 
-        let host_rsp_top = host_stack as u64 + 4096;
+        // `hv/vmcs.cpp::write_vmcs_host_fields`：`((host_stack + host_stack_size) & ~0xF) - 8`
+        let host_rsp_top = host_stack as u64 + HOST_STACK_SIZE as u64;
         let host_rsp = (host_rsp_top & !0xFu64).saturating_sub(8);
         let host_entry = vmexit::vmexit_host_stub as *const () as usize as u64;
         let cpu_self_va = unsafe { self.cpus.add(index as usize) } as u64;
-        let tss_va = host_gdt_tss as u64 + 0x80;
+        let tss_va = tss as u64;
         let host_layout = vmcs::HostVmcsLayout {
             rip: host_entry,
             rsp: host_rsp,
             cr3: host_pt.cr3_value(),
-            gdtr_base: host_gdt_tss as u64,
+            gdtr_base: host_gdt as u64,
             idtr_base: host_idt as u64,
             tr_base: tss_va,
             fs_base: cpu_self_va,
@@ -496,8 +510,6 @@ impl VmxCluster {
             }
             return wdk_sys::STATUS_UNSUCCESSFUL;
         }
-
-        fill_vcpu_cache(cpu);
 
         if let Err(err) = unsafe { vmcs::configure_guest_state() } {
             logger::log_vmcs_error("configure_guest_state", vmcs::VmcsField::GUEST_CR3, err);

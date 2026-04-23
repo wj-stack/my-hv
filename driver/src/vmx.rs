@@ -117,7 +117,8 @@ pub unsafe fn vmcall(rax: u64, rcx: u64, rdx: u64) -> (bool, u64) {
     (fail == 0, out_rax)
 }
 
-#[repr(C)]
+/// 128 位 INVEPT 描述符；必须 16 字节对齐（SDM 对 `m128` 操作数的要求）。
+#[repr(C, align(16))]
 pub struct InveptDescriptor {
     pub eptp: u64,
     pub reserved: u64,
