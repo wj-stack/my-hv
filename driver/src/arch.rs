@@ -74,6 +74,12 @@ pub fn read_dr7() -> u64 {
     v
 }
 
+/// 与 `hv` 中 `_readfsbase_u64` 一致（当前 `IA32_FS_BASE`）。
+#[inline]
+pub fn read_fsbase() -> u64 {
+    unsafe { rdmsr(ia32::IA32_FS_BASE) }
+}
+
 pub unsafe fn write_cr0(v: u64) {
     unsafe { core::arch::asm!("mov cr0, {}", in(reg) v) };
 }

@@ -28,3 +28,10 @@ pub fn log_vm_exit_reason(reason_basic: u16, raw: u32) {
         reason_basic, raw
     );
 }
+
+pub fn log_host_exception(vector: u64, rip: u64, error: u64) {
+    println!(
+        "[my-hv-driver] host exception: vector={}, rip=0x{:x}, error=0x{:x}",
+        vector, rip, error
+    );
+}

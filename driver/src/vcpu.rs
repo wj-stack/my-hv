@@ -1,5 +1,7 @@
 //! 每逻辑处理器的 VMXON/VMCS 生命周期。对应 `hv/hv/vcpu.cpp`、`hv/hv/vcpu.h` 中的 `virtualize_cpu` / `stop` 路径。
 
+use alloc::boxed::Box;
+
 use core::mem::size_of;
 
 use wdk_sys::ntddk::{
@@ -11,6 +13,8 @@ use wdk_sys::{NTSTATUS, POOL_FLAG_NON_PAGED, SIZE_T, ULONG};
 
 use crate::arch::{self, VmxFixedMsrs};
 use crate::ept::EptState;
+use crate::host_descriptor::{self, HostTaskState};
+use crate::host_page_tables::HostPageTables;
 use crate::ia32;
 use crate::logger;
 use crate::msr_bitmap;
@@ -87,9 +91,15 @@ pub struct PerCpuState {
     pub guest_stub_page: *mut u8,
     /// MSR 自动存/装列表（`hv` 的 `msr_exit_store` + `msr_entry_load`），单页。
     pub msr_auto_page: *mut u8,
+    /// `prepare_host_idt`：256 项 × 16 字节。
+    pub host_idt_page: *mut u8,
+    /// GDT（前 32 字节）+ 对齐后的 `HostTaskState`。
+    pub host_gdt_tss_page: *mut u8,
     pub ept: Option<EptState>,
     /// 与参考 `cache_cpu_data` 对齐的只读/伪造 MSR 缓存。
     pub cache: VcpuCache,
+    /// 参考 `vcpu::queued_nmis`：host NMI 在 `dispatch_host_interrupt` 中递增。
+    pub queued_nmis: u32,
     /// 已成功执行 `VMXON`。
     pub vmxon_done: bool,
 }
@@ -106,8 +116,11 @@ impl PerCpuState {
             host_stack_page: core::ptr::null_mut(),
             guest_stub_page: core::ptr::null_mut(),
             msr_auto_page: core::ptr::null_mut(),
+            host_idt_page: core::ptr::null_mut(),
+            host_gdt_tss_page: core::ptr::null_mut(),
             ept: None,
             cache: VcpuCache::empty(),
+            queued_nmis: 0,
             vmxon_done: false,
         }
     }
@@ -120,6 +133,8 @@ impl PerCpuState {
             free_contiguous_page(self.host_stack_page);
             free_contiguous_page(self.guest_stub_page);
             free_contiguous_page(self.msr_auto_page);
+            free_contiguous_page(self.host_idt_page);
+            free_contiguous_page(self.host_gdt_tss_page);
         }
         if let Some(mut ept) = self.ept.take() {
             unsafe { ept.release() };
@@ -130,6 +145,8 @@ impl PerCpuState {
         self.host_stack_page = core::ptr::null_mut();
         self.guest_stub_page = core::ptr::null_mut();
         self.msr_auto_page = core::ptr::null_mut();
+        self.host_idt_page = core::ptr::null_mut();
+        self.host_gdt_tss_page = core::ptr::null_mut();
         self.msr_bitmap_phys = 0;
         self.vmxon_done = false;
     }
@@ -141,6 +158,8 @@ pub struct VmxCluster {
     count: u32,
     /// 所有 CPU 均完成 `VMXON`。
     active: bool,
+    /// 与 `ghv.host_page_tables` 一致：全 VCPU 共享 host CR3 页表。
+    host_page_tables: Option<Box<HostPageTables>>,
 }
 
 impl VmxCluster {
@@ -195,26 +214,36 @@ impl VmxCluster {
             cpus,
             count,
             active: false,
+            host_page_tables: None,
+        };
+
+        let system_cr3 = introspection::query_process_cr3(4).unwrap_or_else(arch::read_cr3);
+        let Some(host_pt) = HostPageTables::prepare(system_cr3) else {
+            logger::log("prepare HostPageTables failed");
+            unsafe { ExFreePoolWithTag(cpus.cast(), POOL_TAG) };
+            return Err(wdk_sys::STATUS_INSUFFICIENT_RESOURCES);
         };
 
         for i in 0..count {
             let affinity: u64 = 1u64 << i;
             let prev = unsafe { KeSetSystemAffinityThreadEx(affinity) };
-            let st = unsafe { cluster.init_cpu(i) };
+            let st = unsafe { cluster.init_cpu(i, &host_pt) };
             unsafe { KeRevertToUserAffinityThreadEx(prev) };
             if !wdk::nt_success(st) {
                 logger::log("VMX init failed on a CPU, starting rollback");
                 unsafe { cluster.rollback_partial(i) };
                 unsafe { ExFreePoolWithTag(cpus.cast(), POOL_TAG) };
+                drop(host_pt);
                 return Err(st);
             }
         }
 
+        cluster.host_page_tables = Some(host_pt);
         cluster.active = true;
         Ok(cluster)
     }
 
-    unsafe fn init_cpu(&mut self, index: u32) -> NTSTATUS {
+    unsafe fn init_cpu(&mut self, index: u32, host_pt: &HostPageTables) -> NTSTATUS {
         let cpu = unsafe { &mut *self.cpus.add(index as usize) };
         *cpu = PerCpuState::empty();
 
@@ -265,6 +294,31 @@ impl VmxCluster {
             }
             return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
         };
+        let Some(host_idt) = (unsafe { mm::alloc_contiguous_page() }) else {
+            logger::log("failed to allocate host IDT page");
+            unsafe {
+                free_contiguous_page(vmxon);
+                free_contiguous_page(vmcs);
+                free_contiguous_page(msr_bitmap);
+                free_contiguous_page(host_stack);
+                free_contiguous_page(guest_stub);
+                free_contiguous_page(msr_auto);
+            }
+            return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
+        };
+        let Some(host_gdt_tss) = (unsafe { mm::alloc_contiguous_page() }) else {
+            logger::log("failed to allocate host GDT/TSS page");
+            unsafe {
+                free_contiguous_page(vmxon);
+                free_contiguous_page(vmcs);
+                free_contiguous_page(msr_bitmap);
+                free_contiguous_page(host_stack);
+                free_contiguous_page(guest_stub);
+                free_contiguous_page(msr_auto);
+                free_contiguous_page(host_idt);
+            }
+            return wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
+        };
 
         // 在 `VMXON` / `VMCLEAR` 之前初始化各 4KiB 控制结构。对照 `hv/hv/vcpu.cpp` 的 `virtualize_cpu`：
         // - `prepare_vmxon_region` ≈ `enter_vmx_operation()` 里对 `vmxon_region.revision_id` / `must_be_zero` 的填写；
@@ -284,6 +338,10 @@ impl VmxCluster {
             // 独立物理页上的 `GUEST_STUB_CODE`（xor rax,rax; vmcall; 死循环），作为最小 guest 入口。
             core::ptr::copy_nonoverlapping(GUEST_STUB_CODE.as_ptr(), guest_stub, GUEST_STUB_CODE.len());
             vmcs::prepare_msr_auto_lists(msr_auto);
+            let tss = host_gdt_tss.add(0x80).cast::<HostTaskState>();
+            core::ptr::write_bytes(tss, 0, size_of::<HostTaskState>());
+            host_descriptor::prepare_host_idt(host_idt);
+            host_descriptor::prepare_host_gdt(host_gdt_tss, tss);
         }
 
         let Some(fixed) = VmxFixedMsrs::read() else {
@@ -295,6 +353,8 @@ impl VmxCluster {
                 free_contiguous_page(host_stack);
                 free_contiguous_page(guest_stub);
                 free_contiguous_page(msr_auto);
+                free_contiguous_page(host_idt);
+                free_contiguous_page(host_gdt_tss);
             }
             return wdk_sys::STATUS_NOT_SUPPORTED;
         };
@@ -308,6 +368,8 @@ impl VmxCluster {
                 free_contiguous_page(host_stack);
                 free_contiguous_page(guest_stub);
                 free_contiguous_page(msr_auto);
+                free_contiguous_page(host_idt);
+                free_contiguous_page(host_gdt_tss);
             }
             return wdk_sys::STATUS_NOT_SUPPORTED;
         }
@@ -326,6 +388,8 @@ impl VmxCluster {
         cpu.host_stack_page = host_stack;
         cpu.guest_stub_page = guest_stub;
         cpu.msr_auto_page = msr_auto;
+        cpu.host_idt_page = host_idt;
+        cpu.host_gdt_tss_page = host_gdt_tss;
         cpu.ept = ept;
 
         if !unsafe { vmx::vmxon(&raw const cpu.vmxon_phys) } {
@@ -392,7 +456,18 @@ impl VmxCluster {
         let host_rsp_top = host_stack as u64 + 4096;
         let host_rsp = (host_rsp_top & !0xFu64).saturating_sub(8);
         let host_entry = vmexit::vmexit_host_stub as *const () as usize as u64;
-        if let Err(err) = unsafe { vmcs::configure_host_state(host_entry, host_rsp) } {
+        let cpu_self_va = unsafe { self.cpus.add(index as usize) } as u64;
+        let tss_va = host_gdt_tss as u64 + 0x80;
+        let host_layout = vmcs::HostVmcsLayout {
+            rip: host_entry,
+            rsp: host_rsp,
+            cr3: host_pt.cr3_value(),
+            gdtr_base: host_gdt_tss as u64,
+            idtr_base: host_idt as u64,
+            tr_base: tss_va,
+            fs_base: cpu_self_va,
+        };
+        if let Err(err) = unsafe { vmcs::configure_host_state(&host_layout) } {
             logger::log_vmcs_error("configure_host_state", vmcs::VmcsField::HOST_RIP, err);
             let _ = unsafe { vmx::vmxoff() };
             unsafe {
@@ -528,6 +603,8 @@ impl VmxCluster {
                 KeRevertToUserAffinityThreadEx(prev);
             }
         }
+
+        self.host_page_tables.take();
 
         unsafe {
             ExFreePoolWithTag(self.cpus.cast(), POOL_TAG);

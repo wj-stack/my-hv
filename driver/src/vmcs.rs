@@ -620,18 +620,29 @@ pub unsafe fn prepare_msr_auto_lists(page: *mut u8) {
     }
 }
 
-/// 写入最小 host 字段（仅用于后续 VM-entry 路径打底）。
+/// 与 `hv/hv/vmcs.cpp::write_vmcs_host_fields` 一致的 host 视图（专用 CR3 / GDT / IDT / TSS）。
+#[derive(Clone, Copy, Debug)]
+pub struct HostVmcsLayout {
+    pub rip: u64,
+    pub rsp: u64,
+    pub cr3: u64,
+    pub gdtr_base: u64,
+    pub idtr_base: u64,
+    pub tr_base: u64,
+    /// 与参考工程一致：`HOST_FS_BASE` 指向当前 `PerCpuState`。
+    pub fs_base: u64,
+}
+
+/// 复位风格 `IA32_PAT`（与 Linux 默认 / `hv` `write_vmcs_host_fields` 构造一致）。
+const HOST_PAT_RESET: u64 = 0x00070406_00070406;
+
+/// 写入 host 字段。对应 `write_vmcs_host_fields`（`host_cs_selector=0x08`, `host_tr_selector=0x10`）。
 ///
 /// # Safety
 /// 需要已 `VMPTRLD`。
-pub unsafe fn configure_host_state(host_rip: u64, host_rsp: u64) -> Result<(), VmcsAccessError> {
-    let gdtr = gdt::read_gdtr();
-    let idtr = idt::read_idtr();
-    // SAFETY: GDTR/IDTR 是 packed 结构，使用 read_unaligned 读取字段。
-    let gdtr_base = unsafe { core::ptr::addr_of!(gdtr.base).read_unaligned() };
-    let idtr_base = unsafe { core::ptr::addr_of!(idtr.base).read_unaligned() };
-    let sel = segment::read_segment_selectors();
-    let tr = segment::parse_segment(&gdtr, sel.tr);
+pub unsafe fn configure_host_state(layout: &HostVmcsLayout) -> Result<(), VmcsAccessError> {
+    use crate::host_descriptor::{HOST_CS_SELECTOR, HOST_TR_SELECTOR};
+
     let mut cr4 = arch::read_cr4();
     cr4 |= 1 << 16;
     cr4 |= 1 << 18;
@@ -639,40 +650,31 @@ pub unsafe fn configure_host_state(host_rip: u64, host_rsp: u64) -> Result<(), V
     cr4 &= !(1 << 21);
     unsafe {
         vmwrite(VmcsField::HOST_CR0, arch::read_cr0())?;
-        vmwrite(VmcsField::HOST_CR3, arch::read_cr3())?;
+        vmwrite(VmcsField::HOST_CR3, layout.cr3)?;
         vmwrite(VmcsField::HOST_CR4, cr4)?;
-        vmwrite(VmcsField::HOST_RIP, host_rip)?;
-        vmwrite(VmcsField::HOST_RSP, host_rsp)?;
-        vmwrite(VmcsField::HOST_GDTR_BASE, gdtr_base)?;
-        vmwrite(VmcsField::HOST_IDTR_BASE, idtr_base)?;
+        vmwrite(VmcsField::HOST_RIP, layout.rip)?;
+        vmwrite(VmcsField::HOST_RSP, layout.rsp)?;
+        vmwrite(VmcsField::HOST_GDTR_BASE, layout.gdtr_base)?;
+        vmwrite(VmcsField::HOST_IDTR_BASE, layout.idtr_base)?;
 
         vmwrite(VmcsField::HOST_ES_SELECTOR, 0)?;
-        vmwrite(VmcsField::HOST_CS_SELECTOR, sel.cs as u64)?;
+        vmwrite(VmcsField::HOST_CS_SELECTOR, u64::from(HOST_CS_SELECTOR))?;
         vmwrite(VmcsField::HOST_SS_SELECTOR, 0)?;
         vmwrite(VmcsField::HOST_DS_SELECTOR, 0)?;
         vmwrite(VmcsField::HOST_FS_SELECTOR, 0)?;
         vmwrite(VmcsField::HOST_GS_SELECTOR, 0)?;
-        vmwrite(VmcsField::HOST_TR_SELECTOR, sel.tr as u64)?;
+        vmwrite(VmcsField::HOST_TR_SELECTOR, u64::from(HOST_TR_SELECTOR))?;
 
-        vmwrite(VmcsField::HOST_FS_BASE, unsafe { arch::rdmsr(ia32::IA32_FS_BASE) })?;
+        vmwrite(VmcsField::HOST_FS_BASE, layout.fs_base)?;
         vmwrite(VmcsField::HOST_GS_BASE, 0)?;
-        vmwrite(VmcsField::HOST_TR_BASE, tr.base)?;
+        vmwrite(VmcsField::HOST_TR_BASE, layout.tr_base)?;
 
-        vmwrite(
-            VmcsField::HOST_IA32_SYSENTER_CS,
-            unsafe { arch::rdmsr(ia32::IA32_SYSENTER_CS) } & 0xFFFF,
-        )?;
-        vmwrite(
-            VmcsField::HOST_IA32_SYSENTER_ESP,
-            unsafe { arch::rdmsr(ia32::IA32_SYSENTER_ESP) },
-        )?;
-        vmwrite(
-            VmcsField::HOST_IA32_SYSENTER_EIP,
-            unsafe { arch::rdmsr(ia32::IA32_SYSENTER_EIP) },
-        )?;
+        vmwrite(VmcsField::HOST_IA32_SYSENTER_CS, 0)?;
+        vmwrite(VmcsField::HOST_IA32_SYSENTER_ESP, 0)?;
+        vmwrite(VmcsField::HOST_IA32_SYSENTER_EIP, 0)?;
 
-        vmwrite(VmcsField::HOST_PAT, unsafe { arch::rdmsr(ia32::IA32_PAT) })?;
-        vmwrite(VmcsField::HOST_EFER, unsafe { arch::read_msr_efer() })?;
+        vmwrite(VmcsField::HOST_PAT, HOST_PAT_RESET)?;
+        vmwrite(VmcsField::HOST_EFER, arch::read_msr_efer())?;
         vmwrite(VmcsField::HOST_IA32_PERF_GLOBAL_CTRL, 0)?;
     }
     Ok(())

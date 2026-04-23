@@ -44,9 +44,13 @@ mod logger;
 mod mm;
 mod segment;
 mod timing;
+mod host_page_tables;
+mod host_descriptor;
 mod vmcs;
 mod vmexit;
 mod vcpu;
+mod host_isr;
+mod host_interrupts;
 mod vm_launch;
 mod vmx;
 
