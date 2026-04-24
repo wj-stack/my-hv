@@ -13,7 +13,7 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 shared-contract = { path = "../shared-contract" }
-windows = { version = "0.59", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
