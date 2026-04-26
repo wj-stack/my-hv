@@ -225,15 +225,17 @@ fn decode_vmx_status(rflags: u64) -> VmxInstructionStatus {
 unsafe fn vmwrite_raw(field: VmcsField, value: u64) -> VmxInstructionStatus {
     let rflags: u64;
     unsafe {
-        // Intel：`VMWRITE` 的源操作数为待写入值，目的（字段编码）为第二操作数。LLVM AT&T 下需写成
-        // `vmwrite {field}, {value}`，才能在 Win64 ABI（RCX/RDX）下得到 `vmwriteq %rdx, %rcx`。
+        // SDM 助记为「第二操作数字段编码、第一操作数 64 位值」。GAS **AT&T** 与 `vmread` 相反：
+        // `vmwrite value, field`（见 Linux `__vmwrite`：`"vmwrite %0, %1"` 里 %0=值、%1=编码），与 `att_syntax` 搭配时须写成
+        // `vmwrite {value}, {field}`。勿与 `vmread field, dest` 混用同序。
         core::arch::asm!(
-            "vmwrite {field}, {value}",
+            "vmwrite {value}, {field}",
             "pushfq",
             "pop {rflags}",
             value = in(reg) value,
             field = in(reg) field.raw() as u64,
             rflags = lateout(reg) rflags,
+            options(nostack, att_syntax),
         );
     }
     decode_vmx_status(rflags)
@@ -244,7 +246,8 @@ unsafe fn vmread_raw(field: VmcsField) -> (VmxInstructionStatus, u64) {
     let value: u64;
     let rflags: u64;
     unsafe {
-        // 与 `VMWRITE` 同理：`VMREAD` 第一操作数为读出的值，第二为字段编码。
+        // 与上：默认 GAS **Intel 模式**；`att_syntax` 后 **AT&T** 下为 `vmread field, value_out`（与内核 `vmread` 一致）；
+        // 勿与 `vmwrite value, field` 的次序混淆。
         core::arch::asm!(
             "vmread {field}, {value}",
             "pushfq",
@@ -252,6 +255,7 @@ unsafe fn vmread_raw(field: VmcsField) -> (VmxInstructionStatus, u64) {
             value = lateout(reg) value,
             field = in(reg) field.raw() as u64,
             rflags = lateout(reg) rflags,
+            options(nostack, att_syntax),
         );
     }
     (decode_vmx_status(rflags), value)
@@ -770,14 +774,16 @@ pub unsafe fn configure_host_state(layout: &HostVmcsLayout) -> Result<(), VmcsAc
 /// # Safety
 /// 需要已 `VMPTRLD`。
 pub unsafe fn configure_guest_state() -> Result<(), VmcsAccessError> {
+    use crate::logger;
+    use alloc::format;
     macro_rules! log_orig {
         ($field:ident, $name:expr, $val:expr) => {
             if let Ok(orig) = vmread(VmcsField::$field) {
-                println!(concat!("[GUEST] orig ", $name, " = 0x{:x}"), orig);
+                logger::log(&format!(concat!("[GUEST] orig ", $name, " = 0x{:x}"), orig));
             } else {
-                println!(concat!("[GUEST] orig ", $name, " = <unavailable>"));
+                logger::log(&format!(concat!("[GUEST] orig ", $name, " = <unavailable>")));
             }
-            println!(concat!("[GUEST] new ", $name, " = 0x{:x}"), $val);
+            logger::log(&format!(concat!("[GUEST] new ", $name, " = 0x{:x}"), $val));
         };
     }
     unsafe {

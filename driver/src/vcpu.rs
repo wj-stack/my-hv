@@ -538,39 +538,37 @@ impl VmxCluster {
         if let Ok(guest_state) = guest_state {
             logger::log_vmcs_guest_state(guest_state.rip, guest_state.rsp, guest_state.rflags);
         }
-
-        wdk_sys::STATUS_UNSUCCESSFUL
         
+        
+        if !unsafe { vm_launch::vmlaunch_enter_guest() } {
+            let inst_err = unsafe { vmcs::vmread(vmcs::VmcsField::VM_INSTRUCTION_ERROR) };
+            match inst_err {
+                Ok(c) => {
+                    wdk::println!(
+                        "[my-hv-driver] VMLAUNCH failed, VM_INSTRUCTION_ERROR=0x{:x}",
+                        c
+                    );
+                }
+                Err(e) => {
+                    logger::log_vmcs_error("vmread(VM_INSTRUCTION_ERROR)", e);
+                }
+            }
+            let _ = unsafe { vmx::vmxoff() };
+            unsafe {
+                arch::disable_vmx_hardware();
+                cpu.free_pages();
+            }
+            return wdk_sys::STATUS_UNSUCCESSFUL;
+        }
 
-        // if !unsafe { vm_launch::vmlaunch_enter_guest() } {
-        //     let inst_err = unsafe { vmcs::vmread(vmcs::VmcsField::VM_INSTRUCTION_ERROR) };
-        //     match inst_err {
-        //         Ok(c) => {
-        //             wdk::println!(
-        //                 "[my-hv-driver] VMLAUNCH failed, VM_INSTRUCTION_ERROR=0x{:x}",
-        //                 c
-        //             );
-        //         }
-        //         Err(e) => {
-        //             logger::log_vmcs_error("vmread(VM_INSTRUCTION_ERROR)", e);
-        //         }
-        //     }
-        //     let _ = unsafe { vmx::vmxoff() };
-        //     unsafe {
-        //         arch::disable_vmx_hardware();
-        //         cpu.free_pages();
-        //     }
-        //     return wdk_sys::STATUS_UNSUCCESSFUL;
-        // }
+        let rax_ping = (HYPERCALL_KEY << 8) | (HypercallCode::Ping as u64);
+        let (ok, rax_out) = unsafe { vmx::vmcall(rax_ping, 0, 0) };
+        if ok && rax_out == HYPERVISOR_SIGNATURE {
+            wdk::println!("[my-hv-driver] post-VMLAUNCH PING returned hypervisor signature");
+        }
 
-        // let rax_ping = (HYPERCALL_KEY << 8) | (HypercallCode::Ping as u64);
-        // let (ok, rax_out) = unsafe { vmx::vmcall(rax_ping, 0, 0) };
-        // if ok && rax_out == HYPERVISOR_SIGNATURE {
-        //     wdk::println!("[my-hv-driver] post-VMLAUNCH PING returned hypervisor signature");
-        // }
-
-        // cpu.vmxon_done = true;
-        // wdk_sys::STATUS_SUCCESS
+        cpu.vmxon_done = true;
+        wdk_sys::STATUS_SUCCESS
     }
 
     unsafe fn rollback_partial(&mut self, failed_index: u32) {
