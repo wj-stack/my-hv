@@ -1,5 +1,7 @@
 //! VMCS 区域初始化与访问封装。对应 `hv/hv/vmcs.h`、`hv/hv/vmcs.cpp`。
 
+use wdk::println;
+
 use crate::{arch, ia32};
 use crate::{gdt, idt, segment};
 
@@ -344,86 +346,121 @@ pub unsafe fn configure_guest_segment_state() -> Result<(), VmcsAccessError> {
     let tr = segment::parse_segment(&gdtr, sel.tr);
     let ldtr = segment::parse_ldtr(&gdtr);
 
+    // 分段变量化写入与打印
     unsafe {
-        vmwrite_segment(
-            VmcsField::GUEST_ES_SELECTOR,
-            VmcsField::GUEST_ES_LIMIT,
-            VmcsField::GUEST_ES_ACCESS_RIGHTS,
-            VmcsField::GUEST_ES_BASE,
-            es,
-        )?;
-        vmwrite_segment(
-            VmcsField::GUEST_CS_SELECTOR,
-            VmcsField::GUEST_CS_LIMIT,
-            VmcsField::GUEST_CS_ACCESS_RIGHTS,
-            VmcsField::GUEST_CS_BASE,
-            cs,
-        )?;
-        vmwrite_segment(
-            VmcsField::GUEST_SS_SELECTOR,
-            VmcsField::GUEST_SS_LIMIT,
-            VmcsField::GUEST_SS_ACCESS_RIGHTS,
-            VmcsField::GUEST_SS_BASE,
-            ss,
-        )?;
-        vmwrite_segment(
-            VmcsField::GUEST_DS_SELECTOR,
-            VmcsField::GUEST_DS_LIMIT,
-            VmcsField::GUEST_DS_ACCESS_RIGHTS,
-            VmcsField::GUEST_DS_BASE,
-            ds,
-        )?;
-        vmwrite_segment(
-            VmcsField::GUEST_FS_SELECTOR,
-            VmcsField::GUEST_FS_LIMIT,
-            VmcsField::GUEST_FS_ACCESS_RIGHTS,
-            VmcsField::GUEST_FS_BASE,
-            fs,
-        )?;
-        vmwrite_segment(
-            VmcsField::GUEST_GS_SELECTOR,
-            VmcsField::GUEST_GS_LIMIT,
-            VmcsField::GUEST_GS_ACCESS_RIGHTS,
-            VmcsField::GUEST_GS_BASE,
-            gs,
-        )?;
-        vmwrite_segment(
-            VmcsField::GUEST_LDTR_SELECTOR,
-            VmcsField::GUEST_LDTR_LIMIT,
-            VmcsField::GUEST_LDTR_ACCESS_RIGHTS,
-            VmcsField::GUEST_LDTR_BASE,
-            ldtr,
-        )?;
-        vmwrite_segment(
-            VmcsField::GUEST_TR_SELECTOR,
-            VmcsField::GUEST_TR_LIMIT,
-            VmcsField::GUEST_TR_ACCESS_RIGHTS,
-            VmcsField::GUEST_TR_BASE,
-            tr,
-        )?;
+        let segments = [
+            (
+                "ES",
+                VmcsField::GUEST_ES_SELECTOR,
+                VmcsField::GUEST_ES_LIMIT,
+                VmcsField::GUEST_ES_ACCESS_RIGHTS,
+                VmcsField::GUEST_ES_BASE,
+                &es,
+            ),
+            (
+                "CS",
+                VmcsField::GUEST_CS_SELECTOR,
+                VmcsField::GUEST_CS_LIMIT,
+                VmcsField::GUEST_CS_ACCESS_RIGHTS,
+                VmcsField::GUEST_CS_BASE,
+                &cs,
+            ),
+            (
+                "SS",
+                VmcsField::GUEST_SS_SELECTOR,
+                VmcsField::GUEST_SS_LIMIT,
+                VmcsField::GUEST_SS_ACCESS_RIGHTS,
+                VmcsField::GUEST_SS_BASE,
+                &ss,
+            ),
+            (
+                "DS",
+                VmcsField::GUEST_DS_SELECTOR,
+                VmcsField::GUEST_DS_LIMIT,
+                VmcsField::GUEST_DS_ACCESS_RIGHTS,
+                VmcsField::GUEST_DS_BASE,
+                &ds,
+            ),
+            (
+                "FS",
+                VmcsField::GUEST_FS_SELECTOR,
+                VmcsField::GUEST_FS_LIMIT,
+                VmcsField::GUEST_FS_ACCESS_RIGHTS,
+                VmcsField::GUEST_FS_BASE,
+                &fs,
+            ),
+            (
+                "GS",
+                VmcsField::GUEST_GS_SELECTOR,
+                VmcsField::GUEST_GS_LIMIT,
+                VmcsField::GUEST_GS_ACCESS_RIGHTS,
+                VmcsField::GUEST_GS_BASE,
+                &gs,
+            ),
+            (
+                "LDTR",
+                VmcsField::GUEST_LDTR_SELECTOR,
+                VmcsField::GUEST_LDTR_LIMIT,
+                VmcsField::GUEST_LDTR_ACCESS_RIGHTS,
+                VmcsField::GUEST_LDTR_BASE,
+                &ldtr,
+            ),
+            (
+                "TR",
+                VmcsField::GUEST_TR_SELECTOR,
+                VmcsField::GUEST_TR_LIMIT,
+                VmcsField::GUEST_TR_ACCESS_RIGHTS,
+                VmcsField::GUEST_TR_BASE,
+                &tr,
+            ),
+        ];
 
-        vmwrite(VmcsField::GUEST_GDTR_LIMIT, gdtr_limit)?;
-        vmwrite(VmcsField::GUEST_GDTR_BASE, gdtr_base)?;
-        vmwrite(VmcsField::GUEST_IDTR_LIMIT, idtr_limit)?;
-        vmwrite(VmcsField::GUEST_IDTR_BASE, idtr_base)?;
+        for (name, selector, limit, ar, base, seg) in &segments {
+            println!(
+                "GUEST_{}: selector=0x{:x}, limit=0x{:x}, ar=0x{:x}, base=0x{:x}",
+                name, seg.selector, seg.limit, seg.access_rights, seg.base
+            );
+            vmwrite(*selector, seg.selector as u64)?;
+            vmwrite(*limit, seg.limit as u64)?;
+            vmwrite(*ar, seg.access_rights as u64)?;
+            vmwrite(*base, seg.base)?;
+        }
 
-        vmwrite(
-            VmcsField::GUEST_IA32_SYSENTER_CS,
-            unsafe { arch::rdmsr(ia32::IA32_SYSENTER_CS) } & 0xFFFF,
-        )?;
-        vmwrite(
-            VmcsField::GUEST_IA32_SYSENTER_ESP,
-            unsafe { arch::rdmsr(ia32::IA32_SYSENTER_ESP) },
-        )?;
-        vmwrite(
-            VmcsField::GUEST_IA32_SYSENTER_EIP,
-            unsafe { arch::rdmsr(ia32::IA32_SYSENTER_EIP) },
-        )?;
+        let gdt_vars = [
+            ("GUEST_GDTR_LIMIT", VmcsField::GUEST_GDTR_LIMIT, gdtr_limit),
+            ("GUEST_GDTR_BASE", VmcsField::GUEST_GDTR_BASE, gdtr_base),
+            ("GUEST_IDTR_LIMIT", VmcsField::GUEST_IDTR_LIMIT, idtr_limit),
+            ("GUEST_IDTR_BASE", VmcsField::GUEST_IDTR_BASE, idtr_base),
+        ];
+        for (name, field, value) in &gdt_vars {
+            println!("{}: 0x{:x}", name, value);
+            vmwrite(*field, *value)?;
+        }
 
-        vmwrite(VmcsField::GUEST_DEBUGCTL, unsafe { arch::rdmsr(ia32::IA32_DEBUGCTL) })?;
-        vmwrite(VmcsField::GUEST_PAT, unsafe { arch::rdmsr(ia32::IA32_PAT) })?;
+        let sysenter_cs = unsafe { arch::rdmsr(ia32::IA32_SYSENTER_CS) } & 0xFFFF;
+        let sysenter_esp = unsafe { arch::rdmsr(ia32::IA32_SYSENTER_ESP) };
+        let sysenter_eip = unsafe { arch::rdmsr(ia32::IA32_SYSENTER_EIP) };
 
+        println!(
+            "GUEST_IA32_SYSENTER_CS=0x{:x}, ESP=0x{:x}, EIP=0x{:x}",
+            sysenter_cs, sysenter_esp, sysenter_eip
+        );
+        vmwrite(VmcsField::GUEST_IA32_SYSENTER_CS, sysenter_cs)?;
+        vmwrite(VmcsField::GUEST_IA32_SYSENTER_ESP, sysenter_esp)?;
+        vmwrite(VmcsField::GUEST_IA32_SYSENTER_EIP, sysenter_eip)?;
+
+        let debugctl = unsafe { arch::rdmsr(ia32::IA32_DEBUGCTL) };
+        let pat = unsafe { arch::rdmsr(ia32::IA32_PAT) };
+        println!(
+            "GUEST_DEBUGCTL=0x{:x}, GUEST_PAT=0x{:x}",
+            debugctl, pat
+        );
+        vmwrite(VmcsField::GUEST_DEBUGCTL, debugctl)?;
+        vmwrite(VmcsField::GUEST_PAT, pat)?;
+
+        println!("GUEST_INTERRUPTIBILITY_STATE=0");
         vmwrite(VmcsField::GUEST_INTERRUPTIBILITY_STATE, 0)?;
+        println!("GUEST_ACTIVITY_STATE=0");
         vmwrite(VmcsField::GUEST_ACTIVITY_STATE, 0)?;
     }
     Ok(())
@@ -635,38 +672,90 @@ const HOST_PAT_RESET: u64 = 0x00070406_00070406;
 /// 需要已 `VMPTRLD`。
 pub unsafe fn configure_host_state(layout: &HostVmcsLayout) -> Result<(), VmcsAccessError> {
     use crate::host_descriptor::{HOST_CS_SELECTOR, HOST_TR_SELECTOR};
+    use crate::logger;
+    use alloc::format;
 
     let mut cr4 = arch::read_cr4();
     cr4 |= 1 << 16;
     cr4 |= 1 << 18;
     cr4 &= !(1 << 20);
     cr4 &= !(1 << 21);
+
     unsafe {
+        // 打印原始值，日志归类于"host_vmcs_origin"
+        macro_rules! log_orig {
+            ($field:expr, $name:expr) => {
+                match vmread($field) {
+                    Ok(v) => logger::log(&format!("host_vmcs_origin {}: 0x{:x}", $name, v)),
+                    Err(e) => logger::log(&format!("host_vmcs_origin {}: vmread failed: {:?}", $name, e)),
+                }
+            };
+        }
+
+        log_orig!(VmcsField::HOST_CR0, "HOST_CR0");
         vmwrite(VmcsField::HOST_CR0, arch::read_cr0())?;
+
+        log_orig!(VmcsField::HOST_CR3, "HOST_CR3");
         vmwrite(VmcsField::HOST_CR3, layout.cr3)?;
+
+        log_orig!(VmcsField::HOST_CR4, "HOST_CR4");
         vmwrite(VmcsField::HOST_CR4, cr4)?;
+
+        log_orig!(VmcsField::HOST_RIP, "HOST_RIP");
         vmwrite(VmcsField::HOST_RIP, layout.rip)?;
+
+        log_orig!(VmcsField::HOST_RSP, "HOST_RSP");
         vmwrite(VmcsField::HOST_RSP, layout.rsp)?;
+
+        log_orig!(VmcsField::HOST_GDTR_BASE, "HOST_GDTR_BASE");
         vmwrite(VmcsField::HOST_GDTR_BASE, layout.gdtr_base)?;
+
+        log_orig!(VmcsField::HOST_IDTR_BASE, "HOST_IDTR_BASE");
         vmwrite(VmcsField::HOST_IDTR_BASE, layout.idtr_base)?;
 
+        log_orig!(VmcsField::HOST_ES_SELECTOR, "HOST_ES_SELECTOR");
         vmwrite(VmcsField::HOST_ES_SELECTOR, 0)?;
+
+        log_orig!(VmcsField::HOST_CS_SELECTOR, "HOST_CS_SELECTOR");
         vmwrite(VmcsField::HOST_CS_SELECTOR, u64::from(HOST_CS_SELECTOR))?;
+
+        log_orig!(VmcsField::HOST_SS_SELECTOR, "HOST_SS_SELECTOR");
         vmwrite(VmcsField::HOST_SS_SELECTOR, 0)?;
+
+        log_orig!(VmcsField::HOST_DS_SELECTOR, "HOST_DS_SELECTOR");
         vmwrite(VmcsField::HOST_DS_SELECTOR, 0)?;
+
+        log_orig!(VmcsField::HOST_FS_SELECTOR, "HOST_FS_SELECTOR");
         vmwrite(VmcsField::HOST_FS_SELECTOR, 0)?;
+
+        log_orig!(VmcsField::HOST_GS_SELECTOR, "HOST_GS_SELECTOR");
         vmwrite(VmcsField::HOST_GS_SELECTOR, 0)?;
+
+        log_orig!(VmcsField::HOST_TR_SELECTOR, "HOST_TR_SELECTOR");
         vmwrite(VmcsField::HOST_TR_SELECTOR, u64::from(HOST_TR_SELECTOR))?;
 
+        log_orig!(VmcsField::HOST_FS_BASE, "HOST_FS_BASE");
         vmwrite(VmcsField::HOST_FS_BASE, layout.fs_base)?;
+
+        log_orig!(VmcsField::HOST_GS_BASE, "HOST_GS_BASE");
         vmwrite(VmcsField::HOST_GS_BASE, 0)?;
+
+        log_orig!(VmcsField::HOST_TR_BASE, "HOST_TR_BASE");
         vmwrite(VmcsField::HOST_TR_BASE, layout.tr_base)?;
 
+        log_orig!(VmcsField::HOST_IA32_SYSENTER_CS, "HOST_IA32_SYSENTER_CS");
         vmwrite(VmcsField::HOST_IA32_SYSENTER_CS, 0)?;
+
+        log_orig!(VmcsField::HOST_IA32_SYSENTER_ESP, "HOST_IA32_SYSENTER_ESP");
         vmwrite(VmcsField::HOST_IA32_SYSENTER_ESP, 0)?;
+
+        log_orig!(VmcsField::HOST_IA32_SYSENTER_EIP, "HOST_IA32_SYSENTER_EIP");
         vmwrite(VmcsField::HOST_IA32_SYSENTER_EIP, 0)?;
 
+        log_orig!(VmcsField::HOST_PAT, "HOST_PAT");
         vmwrite(VmcsField::HOST_PAT, HOST_PAT_RESET)?;
+
+        log_orig!(VmcsField::HOST_IA32_PERF_GLOBAL_CTRL, "HOST_IA32_PERF_GLOBAL_CTRL");
         vmwrite(VmcsField::HOST_IA32_PERF_GLOBAL_CTRL, 0)?;
     }
     Ok(())
@@ -681,23 +770,67 @@ pub unsafe fn configure_host_state(layout: &HostVmcsLayout) -> Result<(), VmcsAc
 /// # Safety
 /// 需要已 `VMPTRLD`。
 pub unsafe fn configure_guest_state() -> Result<(), VmcsAccessError> {
+    macro_rules! log_orig {
+        ($field:ident, $name:expr, $val:expr) => {
+            if let Ok(orig) = vmread(VmcsField::$field) {
+                println!(concat!("[GUEST] orig ", $name, " = 0x{:x}"), orig);
+            } else {
+                println!(concat!("[GUEST] orig ", $name, " = <unavailable>"));
+            }
+            println!(concat!("[GUEST] new ", $name, " = 0x{:x}"), $val);
+        };
+    }
     unsafe {
-        vmwrite(VmcsField::GUEST_CR0, arch::read_cr0())?;
-        vmwrite(VmcsField::GUEST_CR3, arch::read_cr3())?;
-        vmwrite(VmcsField::GUEST_CR4, arch::read_cr4())?;
-        vmwrite(VmcsField::GUEST_DR7, arch::read_dr7())?;
-        vmwrite(VmcsField::GUEST_RSP, 0)?;
-        vmwrite(VmcsField::GUEST_RIP, 0)?;
-        vmwrite(VmcsField::GUEST_RFLAGS, arch::read_rflags())?;
+        let guest_cr0 = arch::read_cr0();
+        log_orig!(GUEST_CR0, "GUEST_CR0", guest_cr0);
+        vmwrite(VmcsField::GUEST_CR0, guest_cr0)?;
+
+        let guest_cr3 = arch::read_cr3();
+        log_orig!(GUEST_CR3, "GUEST_CR3", guest_cr3);
+        vmwrite(VmcsField::GUEST_CR3, guest_cr3)?;
+
+        let guest_cr4 = arch::read_cr4();
+        log_orig!(GUEST_CR4, "GUEST_CR4", guest_cr4);
+        vmwrite(VmcsField::GUEST_CR4, guest_cr4)?;
+
+        let guest_dr7 = arch::read_dr7();
+        log_orig!(GUEST_DR7, "GUEST_DR7", guest_dr7);
+        vmwrite(VmcsField::GUEST_DR7, guest_dr7)?;
+
+        let guest_rsp = 0;
+        log_orig!(GUEST_RSP, "GUEST_RSP", guest_rsp);
+        vmwrite(VmcsField::GUEST_RSP, guest_rsp)?;
+
+        let guest_rip = 0;
+        log_orig!(GUEST_RIP, "GUEST_RIP", guest_rip);
+        vmwrite(VmcsField::GUEST_RIP, guest_rip)?;
+
+        let guest_rflags = arch::read_rflags();
+        log_orig!(GUEST_RFLAGS, "GUEST_RFLAGS", guest_rflags);
+        vmwrite(VmcsField::GUEST_RFLAGS, guest_rflags)?;
+
+        let perf_global_ctrl = arch::rdmsr(ia32::IA32_PERF_GLOBAL_CTRL);
+        log_orig!(GUEST_IA32_PERF_GLOBAL_CTRL, "GUEST_IA32_PERF_GLOBAL_CTRL", perf_global_ctrl);
         vmwrite(
             VmcsField::GUEST_IA32_PERF_GLOBAL_CTRL,
-            arch::rdmsr(ia32::IA32_PERF_GLOBAL_CTRL),
+            perf_global_ctrl,
         )?;
-        // 以下顺序与 `hv/hv/vmcs.cpp::write_vmcs_guest_fields` 一致（`vmx_active` = 0）。
-        vmwrite(VmcsField::GUEST_ACTIVITY_STATE, 0)?;
-        vmwrite(VmcsField::GUEST_INTERRUPTIBILITY_STATE, 0)?;
-        vmwrite(VmcsField::GUEST_PENDING_DEBUG_EXCEPTIONS, 0)?;
-        vmwrite(VmcsField::GUEST_VMCS_LINK_POINTER, ia32::MAXULONG64)?;
+
+        let activity_state = 0;
+        log_orig!(GUEST_ACTIVITY_STATE, "GUEST_ACTIVITY_STATE", activity_state);
+        vmwrite(VmcsField::GUEST_ACTIVITY_STATE, activity_state)?;
+
+        let interruptibility_state = 0;
+        log_orig!(GUEST_INTERRUPTIBILITY_STATE, "GUEST_INTERRUPTIBILITY_STATE", interruptibility_state);
+        vmwrite(VmcsField::GUEST_INTERRUPTIBILITY_STATE, interruptibility_state)?;
+
+        let pending_dbg_exceptions = 0;
+        log_orig!(GUEST_PENDING_DEBUG_EXCEPTIONS, "GUEST_PENDING_DEBUG_EXCEPTIONS", pending_dbg_exceptions);
+        vmwrite(VmcsField::GUEST_PENDING_DEBUG_EXCEPTIONS, pending_dbg_exceptions)?;
+
+        let vmcs_link_pointer = ia32::MAXULONG64;
+        log_orig!(GUEST_VMCS_LINK_POINTER, "GUEST_VMCS_LINK_POINTER", vmcs_link_pointer);
+        vmwrite(VmcsField::GUEST_VMCS_LINK_POINTER, vmcs_link_pointer)?;
 
         // TODO: 未写 `GUEST_VMX_PREEMPTION_TIMER`：pin 未启用抢占定时器时无需；嵌套环境下对该字段 VMWRITE 易失败。
         // TODO: 写入它可能需要更多的条件

@@ -534,36 +534,43 @@ impl VmxCluster {
         // 不在此做 `read_guest_state_snapshot`：嵌套/受限 VMX 下对 `GUEST_RIP`(0x681E) 等 guest 字段的
         // VMREAD 常被拒绝，且仅用于 bring-up 日志，非 VMLAUNCH 所必需。需要时可手动调用
         // `vmcs::read_guest_state_snapshot`（例如裸机调试）。
-
-        if !unsafe { vm_launch::vmlaunch_enter_guest() } {
-            let inst_err = unsafe { vmcs::vmread(vmcs::VmcsField::VM_INSTRUCTION_ERROR) };
-            match inst_err {
-                Ok(c) => {
-                    wdk::println!(
-                        "[my-hv-driver] VMLAUNCH failed, VM_INSTRUCTION_ERROR=0x{:x}",
-                        c
-                    );
-                }
-                Err(e) => {
-                    logger::log_vmcs_error("vmread(VM_INSTRUCTION_ERROR)", e);
-                }
-            }
-            let _ = unsafe { vmx::vmxoff() };
-            unsafe {
-                arch::disable_vmx_hardware();
-                cpu.free_pages();
-            }
-            return wdk_sys::STATUS_UNSUCCESSFUL;
+        let guest_state = unsafe { vmcs::read_guest_state_snapshot() };
+        if let Ok(guest_state) = guest_state {
+            logger::log_vmcs_guest_state(guest_state.rip, guest_state.rsp, guest_state.rflags);
         }
 
-        let rax_ping = (HYPERCALL_KEY << 8) | (HypercallCode::Ping as u64);
-        let (ok, rax_out) = unsafe { vmx::vmcall(rax_ping, 0, 0) };
-        if ok && rax_out == HYPERVISOR_SIGNATURE {
-            wdk::println!("[my-hv-driver] post-VMLAUNCH PING returned hypervisor signature");
-        }
+        wdk_sys::STATUS_UNSUCCESSFUL
+        
 
-        cpu.vmxon_done = true;
-        wdk_sys::STATUS_SUCCESS
+        // if !unsafe { vm_launch::vmlaunch_enter_guest() } {
+        //     let inst_err = unsafe { vmcs::vmread(vmcs::VmcsField::VM_INSTRUCTION_ERROR) };
+        //     match inst_err {
+        //         Ok(c) => {
+        //             wdk::println!(
+        //                 "[my-hv-driver] VMLAUNCH failed, VM_INSTRUCTION_ERROR=0x{:x}",
+        //                 c
+        //             );
+        //         }
+        //         Err(e) => {
+        //             logger::log_vmcs_error("vmread(VM_INSTRUCTION_ERROR)", e);
+        //         }
+        //     }
+        //     let _ = unsafe { vmx::vmxoff() };
+        //     unsafe {
+        //         arch::disable_vmx_hardware();
+        //         cpu.free_pages();
+        //     }
+        //     return wdk_sys::STATUS_UNSUCCESSFUL;
+        // }
+
+        // let rax_ping = (HYPERCALL_KEY << 8) | (HypercallCode::Ping as u64);
+        // let (ok, rax_out) = unsafe { vmx::vmcall(rax_ping, 0, 0) };
+        // if ok && rax_out == HYPERVISOR_SIGNATURE {
+        //     wdk::println!("[my-hv-driver] post-VMLAUNCH PING returned hypervisor signature");
+        // }
+
+        // cpu.vmxon_done = true;
+        // wdk_sys::STATUS_SUCCESS
     }
 
     unsafe fn rollback_partial(&mut self, failed_index: u32) {
