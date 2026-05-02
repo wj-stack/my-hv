@@ -1,8 +1,12 @@
 //! `VMLAUNCH` 进入序。与 `hv/hv/vm-launch.asm` 一致：无函数序言，在入口时把 `GUEST_RSP`/`GUEST_RIP` 设成与 `call hv_vm_launch` 栈帧及 `2f` 成功桩匹配。
 //!
+//! `global_asm!` 在 x86_64 上**默认 Intel 语法**。不要加 `options(att_syntax)` 却仍写 Intel 助记符，否则会报 “without a size suffix”、`rip` 方括号等错误。
+//! Intel SDM：`VMWRITE r/m64, r64` —— **第一操作数为 VMCS 字段编码，第二操作数为待写入的 64 位值**（与 `hv/hv/vm-launch.asm`：`vmwrite rax, rsp`、`vmwrite rax, rdx`）。
+//!
 //! 成功进入 guest 后由桩 `2:` 上 `ret` 返回到调用方；失败时在 root 中 `xor al,al; ret`。
 
 use core::arch::global_asm;
+use wdk::println;
 
 global_asm!(
     ".text",
@@ -28,7 +32,15 @@ unsafe extern "C" {
 
 /// # Safety
 /// 已 `VMPTRLD` 当前 VMCS，且本线程处于 VMX root，执行序与 C++ `virtualize_cpu` 末尾一致。
-#[inline]
+///
+/// 勿 `#[inline]`：须保留独立 `call hv_vm_launch` 栈（与无序言桩里 `GUEST_RSP` / 成功桩 `2:` 上 `ret` 一致）。
+#[inline(never)]
 pub unsafe fn vmlaunch_enter_guest() -> bool {
-    unsafe { hv_vm_launch() != 0 }
+    // int3
+    unsafe { core::arch::asm!("int3") };
+    let ok = unsafe { hv_vm_launch() != 0 };
+    if !ok {
+        println!("[my-hv-driver] vmlaunch: failed");
+    }
+    ok
 }

@@ -539,7 +539,20 @@ impl VmxCluster {
             logger::log_vmcs_guest_state(guest_state.rip, guest_state.rsp, guest_state.rflags);
         }
         
-        
+
+        if let Err(e) = unsafe { vmcs::diagnose_vmcs_for_vmlaunch() } {
+            wdk::println!(
+                "[my-hv-driver] VMCS pre-VMLAUNCH self-check failed: {:?} (see VMLAUNCH precheck logs)",
+                e
+            );
+            let _ = unsafe { vmx::vmxoff() };
+            unsafe {
+                arch::disable_vmx_hardware();
+                cpu.free_pages();
+            }
+            return wdk_sys::STATUS_UNSUCCESSFUL;
+        }
+
         if !unsafe { vm_launch::vmlaunch_enter_guest() } {
             let inst_err = unsafe { vmcs::vmread(vmcs::VmcsField::VM_INSTRUCTION_ERROR) };
             match inst_err {

@@ -177,6 +177,24 @@ pub enum VmcsAccessError {
     },
 }
 
+/// `diagnose_vmcs_for_vmlaunch` 的失败原因（VMREAD 或预检不变量）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VmlaunchVmcsDiagError {
+    VmcsRead { field: VmcsField },
+    Invariant { msg: &'static str },
+}
+
+impl From<VmcsAccessError> for VmlaunchVmcsDiagError {
+    fn from(e: VmcsAccessError) -> Self {
+        let field = match e {
+            VmcsAccessError::VmFailInvalid { field } | VmcsAccessError::VmFailValid { field, .. } => {
+                field
+            }
+        };
+        VmlaunchVmcsDiagError::VmcsRead { field }
+    }
+}
+
 /// VMCS 中的基本 guest 状态快照（用于 bring-up 期诊断；嵌套 VMX 下 guest VMREAD 可能不可用）。
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,9 +243,8 @@ fn decode_vmx_status(rflags: u64) -> VmxInstructionStatus {
 unsafe fn vmwrite_raw(field: VmcsField, value: u64) -> VmxInstructionStatus {
     let rflags: u64;
     unsafe {
-        // SDM 助记为「第二操作数字段编码、第一操作数 64 位值」。GAS **AT&T** 与 `vmread` 相反：
-        // `vmwrite value, field`（见 Linux `__vmwrite`：`"vmwrite %0, %1"` 里 %0=值、%1=编码），与 `att_syntax` 搭配时须写成
-        // `vmwrite {value}, {field}`。勿与 `vmread field, dest` 混用同序。
+        // Intel SDM：`VMWRITE r/m64, r64` —— **第一操作数 = VMCS 字段编码，第二操作数 = 64 位待写值**（Intel 汇编：`vmwrite field, value`）。
+        // **AT&T** 下两操作数顺序与 Intel 相反，故须 `vmwrite {value}, {field}`（与 `options(att_syntax)` 搭配）。勿与 `vmread` 模板操作数顺序混为一谈。
         core::arch::asm!(
             "vmwrite {value}, {field}",
             "pushfq",
@@ -326,7 +343,7 @@ unsafe fn vmwrite_segment(
     Ok(())
 }
 
-/// Guest 段、GDTR/IDTR、SYSENTER、DEBUGCTL/PAT 镜像当前 CPU（与 `hv/vmcs.cpp::write_vmcs_guest_fields` 一致，不单独写 `GUEST_EFER`）。
+/// Guest 段、GDTR/IDTR、SYSENTER、DEBUGCTL/PAT 镜像当前 CPU（与 `hv/vmcs.cpp::write_vmcs_guest_fields` 一条线；`GUEST_EFER` 在 `configure_guest_state` 写入）。
 ///
 /// # Safety
 /// 需要已 `VMPTRLD`。
@@ -686,81 +703,95 @@ pub unsafe fn configure_host_state(layout: &HostVmcsLayout) -> Result<(), VmcsAc
     cr4 &= !(1 << 21);
 
     unsafe {
-        // 打印原始值，日志归类于"host_vmcs_origin"
-        macro_rules! log_orig {
-            ($field:expr, $name:expr) => {
-                match vmread($field) {
-                    Ok(v) => logger::log(&format!("host_vmcs_origin {}: 0x{:x}", $name, v)),
-                    Err(e) => logger::log(&format!("host_vmcs_origin {}: vmread failed: {:?}", $name, e)),
-                }
-            };
+        macro_rules! log_host_field {
+            ($field:ident, $name:expr, $val:expr) => {{
+                let new_val = $val;
+                let line = if let Ok(orig) = vmread(VmcsField::$field) {
+                    format!(concat!("[HOST] ", $name, ": orig=0x{:x} new=0x{:x}"), orig, new_val)
+                } else {
+                    format!(concat!("[HOST] ", $name, ": orig=<unavailable> new=0x{:x}"), new_val)
+                };
+                logger::log(&line);
+            }};
         }
 
-        log_orig!(VmcsField::HOST_CR0, "HOST_CR0");
-        vmwrite(VmcsField::HOST_CR0, arch::read_cr0())?;
+        let host_cr0 = arch::read_cr0();
+        log_host_field!(HOST_CR0, "HOST_CR0", host_cr0);
+        vmwrite(VmcsField::HOST_CR0, host_cr0)?;
 
-        log_orig!(VmcsField::HOST_CR3, "HOST_CR3");
+        log_host_field!(HOST_CR3, "HOST_CR3", layout.cr3);
         vmwrite(VmcsField::HOST_CR3, layout.cr3)?;
 
-        log_orig!(VmcsField::HOST_CR4, "HOST_CR4");
+        log_host_field!(HOST_CR4, "HOST_CR4", cr4);
         vmwrite(VmcsField::HOST_CR4, cr4)?;
 
-        log_orig!(VmcsField::HOST_RIP, "HOST_RIP");
+        let host_efer = arch::rdmsr(ia32::IA32_EFER);
+        log_host_field!(HOST_EFER, "HOST_EFER", host_efer);
+        vmwrite(VmcsField::HOST_EFER, host_efer)?;
+
+        log_host_field!(HOST_RIP, "HOST_RIP", layout.rip);
         vmwrite(VmcsField::HOST_RIP, layout.rip)?;
 
-        log_orig!(VmcsField::HOST_RSP, "HOST_RSP");
+        log_host_field!(HOST_RSP, "HOST_RSP", layout.rsp);
         vmwrite(VmcsField::HOST_RSP, layout.rsp)?;
 
-        log_orig!(VmcsField::HOST_GDTR_BASE, "HOST_GDTR_BASE");
+        log_host_field!(HOST_GDTR_BASE, "HOST_GDTR_BASE", layout.gdtr_base);
         vmwrite(VmcsField::HOST_GDTR_BASE, layout.gdtr_base)?;
 
-        log_orig!(VmcsField::HOST_IDTR_BASE, "HOST_IDTR_BASE");
+        log_host_field!(HOST_IDTR_BASE, "HOST_IDTR_BASE", layout.idtr_base);
         vmwrite(VmcsField::HOST_IDTR_BASE, layout.idtr_base)?;
 
-        log_orig!(VmcsField::HOST_ES_SELECTOR, "HOST_ES_SELECTOR");
-        vmwrite(VmcsField::HOST_ES_SELECTOR, 0)?;
+        const HOST_SEL_CLEAR: u64 = 0;
+        log_host_field!(HOST_ES_SELECTOR, "HOST_ES_SELECTOR", HOST_SEL_CLEAR);
+        vmwrite(VmcsField::HOST_ES_SELECTOR, HOST_SEL_CLEAR)?;
 
-        log_orig!(VmcsField::HOST_CS_SELECTOR, "HOST_CS_SELECTOR");
-        vmwrite(VmcsField::HOST_CS_SELECTOR, u64::from(HOST_CS_SELECTOR))?;
+        let host_cs_sel = u64::from(HOST_CS_SELECTOR);
+        log_host_field!(HOST_CS_SELECTOR, "HOST_CS_SELECTOR", host_cs_sel);
+        vmwrite(VmcsField::HOST_CS_SELECTOR, host_cs_sel)?;
 
-        log_orig!(VmcsField::HOST_SS_SELECTOR, "HOST_SS_SELECTOR");
-        vmwrite(VmcsField::HOST_SS_SELECTOR, 0)?;
+        log_host_field!(HOST_SS_SELECTOR, "HOST_SS_SELECTOR", HOST_SEL_CLEAR);
+        vmwrite(VmcsField::HOST_SS_SELECTOR, HOST_SEL_CLEAR)?;
 
-        log_orig!(VmcsField::HOST_DS_SELECTOR, "HOST_DS_SELECTOR");
-        vmwrite(VmcsField::HOST_DS_SELECTOR, 0)?;
+        log_host_field!(HOST_DS_SELECTOR, "HOST_DS_SELECTOR", HOST_SEL_CLEAR);
+        vmwrite(VmcsField::HOST_DS_SELECTOR, HOST_SEL_CLEAR)?;
 
-        log_orig!(VmcsField::HOST_FS_SELECTOR, "HOST_FS_SELECTOR");
-        vmwrite(VmcsField::HOST_FS_SELECTOR, 0)?;
+        log_host_field!(HOST_FS_SELECTOR, "HOST_FS_SELECTOR", HOST_SEL_CLEAR);
+        vmwrite(VmcsField::HOST_FS_SELECTOR, HOST_SEL_CLEAR)?;
 
-        log_orig!(VmcsField::HOST_GS_SELECTOR, "HOST_GS_SELECTOR");
-        vmwrite(VmcsField::HOST_GS_SELECTOR, 0)?;
+        log_host_field!(HOST_GS_SELECTOR, "HOST_GS_SELECTOR", HOST_SEL_CLEAR);
+        vmwrite(VmcsField::HOST_GS_SELECTOR, HOST_SEL_CLEAR)?;
 
-        log_orig!(VmcsField::HOST_TR_SELECTOR, "HOST_TR_SELECTOR");
-        vmwrite(VmcsField::HOST_TR_SELECTOR, u64::from(HOST_TR_SELECTOR))?;
+        let host_tr_sel = u64::from(HOST_TR_SELECTOR);
+        log_host_field!(HOST_TR_SELECTOR, "HOST_TR_SELECTOR", host_tr_sel);
+        vmwrite(VmcsField::HOST_TR_SELECTOR, host_tr_sel)?;
 
-        log_orig!(VmcsField::HOST_FS_BASE, "HOST_FS_BASE");
+        log_host_field!(HOST_FS_BASE, "HOST_FS_BASE", layout.fs_base);
         vmwrite(VmcsField::HOST_FS_BASE, layout.fs_base)?;
 
-        log_orig!(VmcsField::HOST_GS_BASE, "HOST_GS_BASE");
-        vmwrite(VmcsField::HOST_GS_BASE, 0)?;
+        log_host_field!(HOST_GS_BASE, "HOST_GS_BASE", HOST_SEL_CLEAR);
+        vmwrite(VmcsField::HOST_GS_BASE, HOST_SEL_CLEAR)?;
 
-        log_orig!(VmcsField::HOST_TR_BASE, "HOST_TR_BASE");
+        log_host_field!(HOST_TR_BASE, "HOST_TR_BASE", layout.tr_base);
         vmwrite(VmcsField::HOST_TR_BASE, layout.tr_base)?;
 
-        log_orig!(VmcsField::HOST_IA32_SYSENTER_CS, "HOST_IA32_SYSENTER_CS");
-        vmwrite(VmcsField::HOST_IA32_SYSENTER_CS, 0)?;
+        log_host_field!(HOST_IA32_SYSENTER_CS, "HOST_IA32_SYSENTER_CS", HOST_SEL_CLEAR);
+        vmwrite(VmcsField::HOST_IA32_SYSENTER_CS, HOST_SEL_CLEAR)?;
 
-        log_orig!(VmcsField::HOST_IA32_SYSENTER_ESP, "HOST_IA32_SYSENTER_ESP");
-        vmwrite(VmcsField::HOST_IA32_SYSENTER_ESP, 0)?;
+        log_host_field!(HOST_IA32_SYSENTER_ESP, "HOST_IA32_SYSENTER_ESP", HOST_SEL_CLEAR);
+        vmwrite(VmcsField::HOST_IA32_SYSENTER_ESP, HOST_SEL_CLEAR)?;
 
-        log_orig!(VmcsField::HOST_IA32_SYSENTER_EIP, "HOST_IA32_SYSENTER_EIP");
-        vmwrite(VmcsField::HOST_IA32_SYSENTER_EIP, 0)?;
+        log_host_field!(HOST_IA32_SYSENTER_EIP, "HOST_IA32_SYSENTER_EIP", HOST_SEL_CLEAR);
+        vmwrite(VmcsField::HOST_IA32_SYSENTER_EIP, HOST_SEL_CLEAR)?;
 
-        log_orig!(VmcsField::HOST_PAT, "HOST_PAT");
+        log_host_field!(HOST_PAT, "HOST_PAT", HOST_PAT_RESET);
         vmwrite(VmcsField::HOST_PAT, HOST_PAT_RESET)?;
 
-        log_orig!(VmcsField::HOST_IA32_PERF_GLOBAL_CTRL, "HOST_IA32_PERF_GLOBAL_CTRL");
-        vmwrite(VmcsField::HOST_IA32_PERF_GLOBAL_CTRL, 0)?;
+        log_host_field!(
+            HOST_IA32_PERF_GLOBAL_CTRL,
+            "HOST_IA32_PERF_GLOBAL_CTRL",
+            HOST_SEL_CLEAR
+        );
+        vmwrite(VmcsField::HOST_IA32_PERF_GLOBAL_CTRL, HOST_SEL_CLEAR)?;
     }
     Ok(())
 }
@@ -778,12 +809,13 @@ pub unsafe fn configure_guest_state() -> Result<(), VmcsAccessError> {
     use alloc::format;
     macro_rules! log_orig {
         ($field:ident, $name:expr, $val:expr) => {
-            if let Ok(orig) = vmread(VmcsField::$field) {
-                logger::log(&format!(concat!("[GUEST] orig ", $name, " = 0x{:x}"), orig));
+            let new_val = $val;
+            let line = if let Ok(orig) = vmread(VmcsField::$field) {
+                format!(concat!("[GUEST] ", $name, ": orig=0x{:x} new=0x{:x}"), orig, new_val)
             } else {
-                logger::log(&format!(concat!("[GUEST] orig ", $name, " = <unavailable>")));
-            }
-            logger::log(&format!(concat!("[GUEST] new ", $name, " = 0x{:x}"), $val));
+                format!(concat!("[GUEST] ", $name, ": orig=<unavailable> new=0x{:x}"), new_val)
+            };
+            logger::log(&line);
         };
     }
     unsafe {
@@ -798,6 +830,12 @@ pub unsafe fn configure_guest_state() -> Result<(), VmcsAccessError> {
         let guest_cr4 = arch::read_cr4();
         log_orig!(GUEST_CR4, "GUEST_CR4", guest_cr4);
         vmwrite(VmcsField::GUEST_CR4, guest_cr4)?;
+
+        // // `ENTRY_CONTROL_IA32E_MODE_GUEST` 已置位时，硬件要求 `GUEST_EFER` 与 64 位 guest 状态一致；留 0 常导致
+        // // VMLAUNCH 失败或进入 guest 后立即 #GP（SDM 26.2 / 表 30-1 guest「IA32-32/IA32e」项）。
+        // let guest_efer = arch::rdmsr(ia32::IA32_EFER);
+        // log_orig!(GUEST_EFER, "GUEST_EFER", guest_efer);
+        // vmwrite(VmcsField::GUEST_EFER, guest_efer)?;
 
         let guest_dr7 = arch::read_dr7();
         log_orig!(GUEST_DR7, "GUEST_DR7", guest_dr7);
@@ -864,6 +902,72 @@ pub unsafe fn read_guest_state_snapshot() -> Result<GuestStateSnapshot, VmcsAcce
 pub unsafe fn read_exit_reason() -> Result<VmExitReason, VmcsAccessError> {
     let raw = unsafe { vmread(VmcsField::EXIT_REASON)? } as u32;
     Ok(VmExitReason::from_raw(raw))
+}
+
+/// 在 `VMLAUNCH` 前对当前 VMCS 做读回 + 轻量不变量检查（不替代 SDM 中「VM-entry」硬件一致性检查）。
+///
+/// 此时 **`GUEST_RIP` / `GUEST_RSP` 为 0 属正常**（`configure_guest_state` 先写 0，由 `hv_vm_launch` 里
+/// 两条 `VMWRITE` 再设真实入口与栈；若 `vm_launch.rs` 的 `vmwrite` 与 GAS 语法错配，VMLAUNCH 会跑飞）。
+///
+/// # Safety
+/// 已 `VMPTRLD` 且处于 VMX root。
+pub unsafe fn diagnose_vmcs_for_vmlaunch() -> Result<(), VmlaunchVmcsDiagError> {
+    use alloc::format;
+    use crate::logger;
+
+    unsafe {
+        let host_rip = vmread(VmcsField::HOST_RIP)?;
+        let host_rsp = vmread(VmcsField::HOST_RSP)?;
+        let host_cr0 = vmread(VmcsField::HOST_CR0)?;
+        let host_cr3 = vmread(VmcsField::HOST_CR3)?;
+        let host_cr4 = vmread(VmcsField::HOST_CR4)?;
+        let pin = vmread(VmcsField::CTRL_PIN_BASED)?;
+        let primary = vmread(VmcsField::CTRL_CPU_BASED)?;
+        let secondary = vmread(VmcsField::CTRL_SECONDARY_CPU_BASED)? as u32;
+        let eptp = vmread(VmcsField::CTRL_EPT_POINTER)?;
+        let guest_rip = vmread(VmcsField::GUEST_RIP)?;
+        let guest_rsp = vmread(VmcsField::GUEST_RSP)?;
+        let guest_activity = vmread(VmcsField::GUEST_ACTIVITY_STATE)?;
+
+        logger::log(&format!(
+            "Before VMLAUNCH: HOST_RIP=0x{host_rip:x} HOST_RSP=0x{host_rsp:x}"
+        ));
+
+        logger::log(&format!(
+            "VMLAUNCH precheck: host rip=0x{host_rip:x} rsp=0x{host_rsp:x} cr0=0x{host_cr0:x} cr3=0x{host_cr3:x} cr4=0x{host_cr4:x} | \
+             pin=0x{pin:x} cpu=0x{primary:x} sec=0x{secondary:x} eptp=0x{eptp:x} | g_rip=0x{guest_rip:x} g_rsp=0x{guest_rsp:x} g_act=0x{guest_activity:x}"
+        ));
+
+        if host_rip == 0 {
+            return Err(VmlaunchVmcsDiagError::Invariant { msg: "HOST_RIP is 0" });
+        }
+        if host_rsp == 0 {
+            return Err(VmlaunchVmcsDiagError::Invariant { msg: "HOST_RSP is 0" });
+        }
+        if host_cr3 == 0 {
+            return Err(VmlaunchVmcsDiagError::Invariant { msg: "HOST_CR3 is 0" });
+        }
+        if secondary & ia32::SECONDARY_CONTROL_ENABLE_EPT != 0
+            && (eptp & 0xFFFF_FFFF_FFFF_F000) == 0
+        {
+            return Err(VmlaunchVmcsDiagError::Invariant {
+                msg: "EPT enabled (secondary) but EPTP physical address field is 0",
+            });
+        }
+        if guest_activity != 0 {
+            return Err(VmlaunchVmcsDiagError::Invariant {
+                msg: "GUEST_ACTIVITY_STATE must be 0 (active) before VMLAUNCH",
+            });
+        }
+        if guest_rip == 0 && guest_rsp == 0 {
+            logger::log(
+                "VMLAUNCH precheck: GUEST_RIP and GUEST_RSP are both 0 (expected: launch stub sets them just before VMLAUNCH; if the guest crashes after VMLAUNCH, verify GAS .intel_syntax and vmwrite order in vm_launch)",
+            );
+        }
+
+        logger::log("VMLAUNCH precheck: critical readback / invariants passed");
+        Ok(())
+    }
 }
 
 /// 将 IA32_VMX_BASIC 中的 VMCS revision 写入区域首 dword，其余清零。
