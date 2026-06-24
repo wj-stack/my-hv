@@ -48,10 +48,10 @@ jobs:
     runs-on: ${{ matrix.runner.name }}
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Checkout windows-drivers-rs actions
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: microsoft/windows-drivers-rs
           ref: main
@@ -106,7 +106,7 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
